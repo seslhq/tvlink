@@ -1,0 +1,13 @@
+[Unit]
+Description=tvlink TV power: always on, on-hours, motion wake, manual or manual+motion
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/tvlink-power
+# lgpio (motion sensor) writes notify files to the working directory: keep them in RAM, not on the SD card.
+WorkingDirectory=/run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+"""TV power over HDMI-CEC: always on, on-hours, plus motion wake, manual, or manual plus motion wake.
+Usage: tvlink-power [test]
+
+POWER_MODE in tvlink.conf:
+  always    on 24/7
+  schedule  on from TV_ON to TV_OFF; standby at TV_OFF
+  motion    as schedule, and outside those hours a sensor on MOTION_PIN wakes it; standby after IDLE_MIN without motion
+  manual    people use the TV remote; the Pi only wakes the TV after a power cut (a boot that was not the planned
+            nightly reboot)
+  manual+motion  as manual, and the sensor wakes the TV when someone arrives after IDLE_MIN with nobody seen; the
+            Pi never sends standby, so a TV switched off while people are still in the room stays off (with a PIR,
+            people sitting still for IDLE_MIN count as gone: use an mmWave sensor where people sit)
+On-time starts with `tvlink on` (wakes a TV that is not on, claims its input). Every 5 min after that the TV is woken
+again if it reports standby, or if it answered before and has gone silent (some TVs drop hotplug in standby), so in
+on-time any standby is undone, even one from the remote. A TV that never answers is only woken when on-time starts.
+Standby is sent when on-time ends and at any start in off-hours; after a power cut it is re-sent for 10 min while the
+TV may still be coming on. Until the clock can be trusted (NTP synced, or the RTC holds a sane date) the TV stays on.
+"""
+import glob
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, time as dtime
+
+CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
+MODES = ("always", "schedule", "motion", "manual", "manual+motion")
+POLL = 300  # seconds between power checks during on-time
+# tmpfs: present means this boot already ran, eg a restart after `tvlink set`
+STARTED = os.environ.get("TVLINK_STARTED", "/run/tvlink-power")
+PLANNED = os.environ.get("TVLINK_PLANNED", "/boot/firmware/.tvlink-planned-reboot")  # left by the nightly reboot
+SYNCED = "/run/systemd/timesync/synchronized"  # timesyncd creates it once NTP has synced this boot
+RTC = "/sys/class/rtc/rtc0/since_epoch"  # Pi 5 RTC: kept across a warm reboot, across a power cut only with a battery
+CLOCK_FLOOR = 1793491200  # 2026-11-01: an RTC reading before this has lost power
+
+
+def read_conf(cli=CLI, **run):
+    """Settings as tvlink reads them (tvlink show), so the conf has one parser. Empty means unset."""
+    out = subprocess.run([cli, "show"], capture_output=True, text=True, errors="replace", timeout=60, **run).stdout
+    return {k: v for k, v in (line.split("=", 1) for line in out.splitlines() if "=" in line) if v}
+
+
+def hhmm(value):
+    try:
+        h, m = value.split(":")
+        return dtime(int(h), int(m))
+    except ValueError:
+        return None
+
+
+def in_hours(now, on, off):
+    """From on to off, local time; off earlier than on wraps past midnight."""
+    t = now.time()
+    return on <= t < off if on <= off else t >= on or t < off
+
+
+def want_on(mode, now, on, off, motion_age, idle_s):
+    """motion_age: seconds since the sensor last saw someone, or None."""
+    if mode == "always" or in_hours(now, on, off):
+        return True
+    return mode == "motion" and motion_age is not None and motion_age < idle_s
+
+
+def presence(last, now, seen, idle_s):
+    """manual+motion, one tick: (wake?, new last-seen time). Someone seen after idle_s with nobody is an arrival;
+    while they stay, last keeps moving, so a held-high sensor never wakes the TV again."""
+    return seen and now - last >= idle_s, now if seen else last
+
+
+def step(want, prev, due, settling=False):
+    """This tick's action: on when on-time starts, check (wake from standby) when a poll is due, off when it ends,
+    settle (standby again unless reported) while a power cut in off-hours may still bring the TV on."""
+    if want and want != prev:
+        return "on"
+    if want and due:
+        return "check"
+    if not want and prev:
+        return "off"
+    if not want and settling and due:
+        return "settle"
+    return None
+
+
+def settings(conf):
+    """(mode, on, off, idle seconds, pin); falls back to always when the mode or hours are unusable."""
+    mode = conf.get("POWER_MODE", "schedule").lower()
+    on, off = hhmm(conf.get("TV_ON", "")), hhmm(conf.get("TV_OFF", ""))
+    if mode not in MODES:
+        print(f"Unknown POWER_MODE={mode}, using always", flush=True)
+        mode = "always"
+    if mode in ("schedule", "motion") and not (on and off and on != off):
+        print(f"POWER_MODE={mode} needs different TV_ON and TV_OFF, using always", flush=True)
+        mode = "always"
+    idle = conf.get("IDLE_MIN", "15")
+    pin = conf.get("MOTION_PIN", "17")
+    idle_min = max(1, int(idle)) if idle.isdigit() else 15  # 0 would never wake: motion is 0 s old on its own tick
+    return mode, on, off, idle_min * 60, int(pin) if pin.isdigit() else 17
+
+
+def clock_ok():
+    """True when the wall clock can be trusted for on-hours."""
+    if os.path.exists(SYNCED):
+        return True
+    try:
+        with open(RTC) as f:
+            return int(f.read()) > CLOCK_FLOOR
+    except (OSError, ValueError):
+        return False
+
+
+def after_power_cut():
+    """True on the first run after a boot that was not the planned nightly reboot, eg a power cut."""
+    if os.path.exists(STARTED):
+        return False
+    open(STARTED, "w").close()
+    planned = os.path.exists(PLANNED)
+    if planned:
+        os.remove(PLANNED)
+    return not planned
+
+
+def tv(action):
+    """tvlink on|off|status. Returns its output (status: on, standby or unknown); on and off output also goes to the
+    journal. A hung cec-ctl raises after 60 s and systemd restarts the service."""
+    out = subprocess.run([CLI, action], stdout=subprocess.PIPE, text=True, timeout=60).stdout.strip()
+    if action != "status" and out:
+        print(out, flush=True)
+    return out
+
+
+def main():
+    conf = read_conf()
+    if conf.get("CEC", "1") != "1":
+        print("CEC=0: not controlling the TV", flush=True)
+        return
+    mode, on, off, idle, pin = settings(conf)
+    power_cut = after_power_cut()
+    pir = None
+    if mode in ("motion", "manual+motion"):
+        try:
+            from gpiozero import MotionSensor
+            pir = MotionSensor(pin)
+        except Exception as e:  # no sensor, no gpiozero, wrong pin: still keep on-hours (or manual)
+            print(f"Motion sensor on GPIO{pin} unavailable ({e}): no motion wake", flush=True)
+    for _ in range(30):  # /dev/cec* can appear after boot starts this
+        if glob.glob("/dev/cec*"):
+            break
+        time.sleep(1)
+    if mode.startswith("manual"):
+        print(f"POWER_MODE={mode}: " + ("power cut, waking the TV" if power_cut else "leaving the TV alone"),
+              flush=True)
+        woke = False
+        for _ in range(20 if power_cut else 0):  # the TV may still be starting up after the same cut
+            seen = tv("status")
+            if seen == "on" or (woke and seen != "standby"):  # stop once a wake got through: no input grabbing
+                break
+            woke = "woken" in tv("on")
+            time.sleep(30)
+        last = time.monotonic()  # anyone here at a start (power cut, reboot, tvlink set) counts as already here
+        if pir is not None:
+            print(f"Motion wake after {idle // 60} min with nobody seen", flush=True)
+        while pir is not None:  # manual+motion: wake on an arrival, never send standby
+            wake, last = presence(last, time.monotonic(), pir.motion_detected, idle)
+            if wake:
+                print("Motion after a quiet spell: waking the TV", flush=True)
+                tv("on")
+            time.sleep(1)
+        return
+    print(f"POWER_MODE={mode}" + ("" if mode == "always" else f" {on:%H:%M}-{off:%H:%M}")
+          + (f", idle {idle // 60} min" if mode == "motion" else ""), flush=True)
+    trusted = clock_ok()
+    if not trusted:
+        print("Clock not set yet (no NTP sync, no RTC time): keeping the TV on until it is", flush=True)
+    settle_until = time.monotonic() + 600 if power_cut else 0.0  # a TV set to come back on after a cut may be slow
+    prev, next_check, motion_at, state, answered = None, 0.0, None, None, False
+    while True:
+        if not trusted and clock_ok():
+            trusted = True
+            print("Clock set", flush=True)
+        now = time.monotonic()
+        if pir is not None and pir.motion_detected:  # held high while someone stays, eg retriggering PIR or mmWave
+            motion_at = now
+        age = None if motion_at is None else now - motion_at
+        want = not trusted or want_on(mode, datetime.now(), on, off, age, idle)
+        if prev is None:  # first tick: wake in on-hours, one standby in off-hours (a restart must not leave it on)
+            prev = not want
+        action = step(want, prev, now >= next_check, now < settle_until)
+        if action in ("check", "settle"):
+            seen = tv("status")
+            answered = answered or seen == "on"
+            if seen != state:
+                state = seen
+                print(f"TV reports {state}", flush=True)
+            if action == "settle" and seen != "standby":
+                tv("off")
+            elif action == "check" and (seen == "standby" or (seen == "unknown" and answered)):
+                tv("on")  # standby, or silent after answering before: it dropped hotplug in standby
+        elif action:
+            tv(action)
+        if action in ("on", "check"):
+            next_check = now + POLL
+        elif action in ("off", "settle"):
+            next_check = now + 30
+        prev = want
+        time.sleep(1)
+
+
+def test():
+    import tempfile
+    global STARTED, PLANNED, SYNCED, RTC
+    d = lambda h, m=0: datetime(2026, 1, 1, h, m)
+    six, ten, two = dtime(6), dtime(22), dtime(2)
+    assert in_hours(d(6), six, ten) and in_hours(d(21, 59), six, ten) and not in_hours(d(22), six, ten)
+    assert in_hours(d(23), ten, two) and in_hours(d(1), ten, two) and not in_hours(d(12), ten, two)  # wraps
+    night = d(3)
+    assert want_on("always", night, six, ten, None, 900)
+    assert not want_on("schedule", night, six, ten, 10, 900)
+    assert want_on("motion", night, six, ten, 10, 900)
+    assert not want_on("motion", night, six, ten, 901, 900)
+    assert not want_on("motion", night, six, ten, None, 900)
+    assert step(True, None, False) == "on" and step(True, False, False) == "on"  # on-time starts, or a cut in it
+    assert step(True, True, True) == "check" and step(True, True, False) is None
+    assert step(False, True, False) == "off" and step(False, None, True) is None and step(False, False, True) is None
+    # first tick sets prev = not want: a start in on-hours wakes, one in off-hours sends standby
+    assert step(True, not True, False) == "on" and step(False, not False, False) == "off"
+    # after a cut in off-hours: re-check every 30 s for 10 min, nothing once the window ends
+    assert step(False, False, True, True) == "settle" and step(False, False, False, True) is None
+    assert step(False, False, True, False) is None and step(True, True, True, True) == "check"
+    assert settings({"POWER_MODE": "motion", "TV_ON": "06:00"})[0] == "always"
+    assert settings({"POWER_MODE": "schedule", "TV_ON": "06:00", "TV_OFF": "06:00"})[0] == "always"
+    assert settings({"POWER_MODE": "bogus"})[0] == "always"
+    assert settings({"POWER_MODE": "manual"})[0] == "manual"  # needs no hours
+    assert settings({"POWER_MODE": "manual+motion"})[0] == "manual+motion"
+    last = 0  # manual+motion: present from the start, stays 20 min (sensor held high), leaves 15 min, comes back
+    for now, seen in [(t, t < 1200) for t in range(0, 3000, 10)]:
+        wake, last = presence(last, now, seen, 900)
+        assert not wake  # never woken while people stay or the room is empty
+    assert presence(last, 3000, True, 900)[0] and not presence(2990, 3000, True, 900)[0]  # back after 15 min: wake
+    assert settings({"TV_ON": "06:00", "TV_OFF": "22:00", "IDLE_MIN": "x"})[3] == 900
+    assert settings({"TV_ON": "06:00", "TV_OFF": "22:00", "IDLE_MIN": "0"})[3] == 60  # 0 would never wake
+    with tempfile.TemporaryDirectory() as tmp:
+        STARTED, PLANNED = os.path.join(tmp, "started"), os.path.join(tmp, "planned")
+        assert after_power_cut() and not after_power_cut()  # power cut, then a service restart in the same boot
+        os.remove(STARTED)
+        open(PLANNED, "w").close()
+        assert not after_power_cut() and not os.path.exists(PLANNED)  # nightly reboot: marker used up
+        SYNCED, RTC = os.path.join(tmp, "synced"), os.path.join(tmp, "rtc")
+        assert not clock_ok()  # power cut, no battery, no NTP yet
+        with open(RTC, "w") as f:
+            f.write("86400\n")  # RTC lost power: 1970
+        assert not clock_ok()
+        with open(RTC, "w") as f:
+            f.write(f"{CLOCK_FLOOR + 1}\n")  # warm reboot, or a battery
+        assert clock_ok()
+        os.remove(RTC)
+        open(SYNCED, "w").close()
+        assert clock_ok()
+    # The conf as staff edit it on a PC, read through the sibling tvlink: never run, odd lines handled.
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = os.path.join(tmp, "tvlink.conf")
+        with open(conf, "w", newline="") as f:
+            f.write("\ufeffOVERLAY_CORNER=top-left\n"  # a BOM some editors put first
+                    "BOARD_URL=https://old.example.com/d/x\n"
+                    "BOARD_URL = https://board.example.com/d/abc?v=#top  # note\n"
+                    "SOURCE='folder'\n"
+                    'FIT="cover" # quoted, then a note\n'
+                    "TV_ON=06:30 # opens\r\n"
+                    "CEC=$(touch pwned)\n"
+                    'POWER_MODE="mo"tion"\n'
+                    "SLIDE_SECONDS=7s\n"
+                    "IDLE_MIN=5")
+        with open(conf, "ab") as f:
+            f.write(b"\nWIFI1_SSID=Caf\xe9")  # saved as Windows-1252 on a PC: read, never a crash
+        cli = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tvlink")
+        got = read_conf(cli, cwd=tmp, env=dict(os.environ, TVLINK_CONF=conf))
+        assert got.pop("VERSION")
+        want = {"BOARD_URL": "https://board.example.com/d/abc?v=#top", "SOURCE": "folder", "FIT": "cover",
+                "TV_ON": "06:30", "TV_OFF": "22:00", "CEC": "1", "POWER_MODE": 'mo"tion', "SLIDE_SECONDS": "10",
+                "IDLE_MIN": "5", "MOTION_PIN": "17", "RESOLUTION": "1920x1080@60", "OVERLAY_CORNER": "top-left",
+                "WIFI1_SSID": "Caf\ufffd"}
+        assert {k: got.get(k) for k in want} == want, got
+        assert not os.path.exists(os.path.join(tmp, "pwned"))
+    print("ok")
+
+
+if __name__ == "__main__":
+    test() if sys.argv[1:] == ["test"] else main()
