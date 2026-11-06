@@ -1,0 +1,178 @@
+<!doctype html>
+<!-- Start page: logo and setup state, or a slideshow of local content, until the board answers; then hands over.
+     Status from /run/tvlink/status.js.
+     SPDX-License-Identifier: Apache-2.0
+     Copyright 2026 cpwillis (https://github.com/seslhq/tvlink) -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tvlink</title>
+<style>
+  :root { --ink: #0E1116; --paper: #F4F6F8; --muted: #9AA4B2; --live: #2FD07A; --warn: #F5A524; --bad: #F04438; }
+  html, body { margin: 0; height: 100%; overflow: hidden; cursor: none; background: var(--ink); color: var(--paper);
+    font-family: system-ui, "DejaVu Sans", sans-serif; }
+  /* 10% title-safe margin: TVs overscan and crop the edges. */
+  main { position: absolute; inset: 10vh 10vw 18vh; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; transition: transform 2s; }
+  svg { width: 36vw; height: auto; }
+  #dot { fill: var(--live); animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  h1 { font-size: 3.2vw; font-weight: 600; margin: 7vh 0 2vh; }
+  p { font-size: 1.9vw; line-height: 1.4; color: var(--muted); margin: 0; max-width: 62vw; }
+  code { color: var(--paper); }
+  footer { position: absolute; left: 10vw; right: 10vw; bottom: 10vh; display: grid;
+    grid-template-columns: 1fr auto 1fr; font-size: 1.5vw; color: var(--muted); transition: transform 2s; }
+  footer :last-child { text-align: right; }
+  #show { position: fixed; inset: 0; background: #000; }
+  #show[hidden] { display: block; visibility: hidden; } /* a page in the frame still loads at full size */
+  #show > * { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity .6s; }
+  #show > .on { opacity: 1; }
+</style>
+</head>
+<body>
+<main id="main">
+  <svg viewBox="0 0 562 110" role="img" aria-label="tvlink">
+    <g fill="none" stroke="#F4F6F8" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="7" y="10" width="160" height="90" rx="16"/>
+      <g transform="translate(214 0)">
+        <path d="M24 15V82A18 18 0 0 0 42 100M8 40H44"/><path d="M68 40L98 100L128 40"/><path d="M154 10V100"/>
+        <path d="M182 40V100"/><path d="M210 40V100M210 70A30 30 0 0 1 270 70V100"/>
+        <path d="M298 10V100M338 40L298 75M310 64.5L340 100"/>
+      </g>
+    </g>
+    <circle cx="396" cy="14" r="8" fill="#F4F6F8"/>
+    <circle id="dot" cx="141" cy="74" r="12"/>
+  </svg>
+  <h1 id="title"></h1>
+  <p id="detail"></p>
+</main>
+<footer id="foot"><span id="device"></span><span id="clock"></span><span>github.com/seslhq/tvlink</span></footer>
+<div id="show" hidden></div>
+<script>
+  const $ = id => document.getElementById(id);
+  // ?status= points at another file for previews off the Pi.
+  const SRC = new URLSearchParams(location.search).get("status") || "/run/tvlink/status.js";
+  const SETUP = "No board link yet. Run <code>sudo tvlink set BOARD_URL=…</code> or add it to tvlink.conf on the " +
+    "SD card.";
+
+  // state -> [title, detail, dot colour]
+  function copy(s) {
+    switch (s.state) {
+      case "setup": return ["Ready to Set Up", null, "--warn"];
+      case "empty": return ["No Files to Show", "Add images or videos to the tvlink folder on the SD card.", "--warn"];
+      case "broken": return ["Can't Play the Local Files",
+        "Use JPEG, PNG, WebP, GIF or SVG images, or H.264 MP4 video.", "--warn"];
+      case "network": return ["No Network",
+        "Plug in Ethernet, or put the Wi-Fi name and password in tvlink.conf on the SD card.", "--bad"];
+      case "waiting": return ["Can't Reach the Board", s.code && s.code !== "000"
+        ? `${s.host} answered HTTP ${s.code}. Retrying.` : `Retrying ${s.host}. The board shows as soon as it answers.`,
+        "--warn"];
+      default: return ["Starting", "This takes a few seconds.", "--live"];
+    }
+  }
+
+  function render(s) {
+    const [title, detail, dot] = copy(s);
+    $("title").textContent = title;
+    if (detail === null) $("detail").innerHTML = SETUP; else $("detail").textContent = detail;
+    $("dot").style.fill = `var(${dot})`;
+    $("device").textContent = [s.name, s.ip || "No IP", s.version && `v${s.version}`].filter(Boolean).join(" · ");
+  }
+
+  // Local content: images for secs (or name.30s.jpg) and videos to the end, by file name; an index.html is shown as
+  // a page in a frame, so the board can still take over. Restarts only when the files or settings change.
+  let list = [], secs = 10, fit = "contain", key = "", broken = "", timer = 0, i = 0, fails = 0;
+  const fileUrl = p => "file://" + p.split("/").map(encodeURIComponent).join("/");
+
+  function folder(s) {
+    const k = JSON.stringify([s.files, s.secs, s.fit]);
+    if (k === key) return;
+    if (k === broken) return render({...s, state: "broken"}); // keep name and IP current
+    const page = s.files.find(f => /\/index\.html$/i.test(f));
+    [key, list, secs, fit, i, fails] = [k, page ? [page] : s.files, s.secs > 0 ? s.secs : 10,
+      s.fit === "cover" ? "cover" : "contain", 0, 0];
+    clearTimeout(timer);
+    next(s);
+  }
+
+  function stop() {
+    key = "";
+    clearTimeout(timer);
+    $("show").hidden = true;
+    $("show").replaceChildren();
+  }
+
+  function next(s) {
+    const gen = key, f = list[i++ % list.length];
+    const kind = /\.html$/i.test(f) ? "iframe" : /\.(mp4|webm)$/i.test(f) ? "video" : "img";
+    const el = document.createElement(kind);
+    const shown = () => {
+      if (gen !== key) return;
+      if (kind === "video" && !el.videoWidth) return el.onerror(); // sound only: the picture can't be decoded
+      fails = 0;
+      if (el.parentNode !== $("show")) $("show").append(el); // moving a frame would reload it
+      $("show").hidden = false;
+      void el.offsetWidth; // apply the start opacity, so the fade runs
+      el.classList.add("on");
+      const olds = [...$("show").children].filter(old => old !== el); // only what was there before this one
+      setTimeout(() => olds.forEach(old => old.remove()), 700);
+      const own = Number(f.match(/\.(\d+)s\.\w+$/)?.[1]);
+      if (kind === "img" && list.length > 1) timer = setTimeout(() => next(s), (own || secs) * 1000);
+    };
+    el.style.objectFit = fit;
+    el.onerror = () => { // skip a broken file; when every file fails in a row, say so instead of showing black
+      if (gen !== key) return;
+      if (++fails < list.length) timer = setTimeout(() => next(s), 1000);
+      else { // try again in 30 s: a file may have been fixed in place or still be copying
+        stop();
+        broken = gen;
+        render({...s, state: "broken"});
+        setTimeout(() => { broken = ""; }, 30000);
+      }
+    };
+    if (kind === "video") {
+      Object.assign(el, {muted: true, autoplay: true, playsInline: true, loop: list.length === 1});
+      el.onended = () => gen === key && next(s);
+      el.addEventListener("canplay", shown, {once: true});
+    } else el.onload = shown;
+    el.src = fileUrl(f);
+    if (kind === "iframe") $("show").append(el); // a frame only loads once it is in the page
+  }
+
+  // Called by status.js. A slow board must not be restarted by the next poll: hand over at most every 30 s.
+  let away = 0;
+  window.tvlink = s => {
+    if (s.state === "ready" && s.url) {
+      if (Date.now() - away > 30000) { away = Date.now(); location.replace(s.url); }
+      return;
+    }
+    if (s.state === "folder" && s.files?.length) return folder(s);
+    stop();
+    broken = "";
+    render(s);
+  };
+
+  function poll() {
+    const tag = document.createElement("script");
+    tag.src = `${SRC}?${Date.now()}`;
+    tag.onload = tag.onerror = () => tag.remove();
+    document.head.append(tag);
+  }
+
+  const tick = () => {
+    $("clock").textContent = new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hourCycle: "h23"});
+  };
+  // Small drift so a screen left on this page never holds one image.
+  const shift = () => {
+    const r = () => Math.round(Math.random() * 16 - 8);
+    $("main").style.transform = $("foot").style.transform = `translate(${r()}px, ${r()}px)`;
+  };
+
+  tvlink({state: "starting"});
+  tick(); poll();
+  setInterval(tick, 10000);
+  setInterval(poll, 3000);
+  setInterval(shift, 300000);
+</script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+# tvlink config, read from /boot/firmware/tvlink.conf. Change with `sudo tvlink set KEY=value`, which
+# restarts what uses it, or edit and reboot. Put notes on their own line starting with #; to keep " #" in a value,
+# quote the whole value. `tvlink show` prints what tvlink reads.
+
+# Page to show full screen, eg https://dashboard.example.com/board
+BOARD_URL=
+
+# Local content: images (jpg, png, webp, gif, svg) and videos (MP4, H.264) in the tvlink folder on this SD card,
+# played by file name; name.30s.jpg shows that image for 30s. An index.html there is shown as a page instead.
+#   auto    the board when it answers; local content while it does not (or with no BOARD_URL)
+#   folder  local content only, no network needed
+SOURCE=auto
+# Seconds per image, and contain (whole image, black bars) or cover (fill the screen, crop the edges).
+SLIDE_SECONDS=10
+FIT=contain
+
+# TV power over HDMI-CEC:
+#   always         on 24/7
+#   schedule       on from TV_ON to TV_OFF, standby at TV_OFF
+#   motion         as schedule; outside those hours a motion sensor wakes it, standby after IDLE_MIN without motion
+#   manual         people use the TV remote; the Pi only wakes the TV after a power cut
+#   manual+motion  as manual, and the sensor wakes it when someone arrives after IDLE_MIN with nobody seen
+POWER_MODE=schedule
+
+# On-hours for schedule and motion, 24h Pi local time. TV_OFF earlier than TV_ON runs past midnight.
+TV_ON=06:00
+TV_OFF=22:00
+
+# Motion modes: IDLE_MIN minutes, and the GPIO (BCM number) the sensor's output is wired to.
+IDLE_MIN=15
+MOTION_PIN=17
+
+# 1 = control the TV over HDMI-CEC, 0 = never touch it.
+CEC=1
+
+# HDMI output mode, eg 1920x1080@60 or 1280x720@60; auto = the TV's preferred mode. Set when the kiosk starts.
+RESOLUTION=1920x1080@60
+
+# Corner of the status badge: bottom-right, bottom-left, top-right, top-left, or off.
+OVERLAY_CORNER=bottom-right
+
+# Wi-Fi, added at each boot (Ethernet needs nothing). Quote names and passwords with spaces or #; a blank password
+# means an open network. WIFI2 is a second network, eg the next one when the site changes its Wi-Fi.
+WIFI_COUNTRY=
+WIFI1_SSID=
+WIFI1_PSK=
+WIFI2_SSID=
+WIFI2_PSK=
+
+# Blank: install upgrades every night (canary units). Mon, Tue, Wed, Thu, Fri, Sat or Sun, spelled exactly so: weekly,
+# days after the canaries; anything else counts as blank. Edit here, then rerun install.sh: tvlink set and a reboot
+# do not apply it.
+UPDATE_DAY=

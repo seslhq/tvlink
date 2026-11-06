@@ -1,0 +1,378 @@
+#!/bin/bash
+# tvlink: show the splash until the board answers, run it full screen, control the TV over HDMI-CEC.
+# Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|update|set KEY=value...
+#        (services use check, kiosk, browser, net, mode)
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+VERSION=0.1.0
+CONF=${TVLINK_CONF:-/boot/firmware/tvlink.conf}
+CONTENT=${TVLINK_CONTENT:-/boot/firmware/tvlink}
+# Keys tvlink set may change. UPDATE_DAY is read too; install.sh applies it.
+KEYS="BOARD_URL SOURCE SLIDE_SECONDS FIT POWER_MODE TV_ON TV_OFF IDLE_MIN MOTION_PIN CEC RESOLUTION OVERLAY_CORNER"
+KEYS+=" WIFI_COUNTRY WIFI1_SSID WIFI1_PSK WIFI2_SSID WIFI2_PSK"
+# shellcheck disable=SC2034
+WIFI_COUNTRY='' WIFI1_SSID='' WIFI1_PSK='' WIFI2_SSID='' WIFI2_PSK=''
+# shellcheck disable=SC2034 # defaults; some are only read through ${!k} in show
+BOARD_URL='' SOURCE=auto SLIDE_SECONDS=10 FIT=contain POWER_MODE=schedule TV_ON=06:00 TV_OFF=22:00 IDLE_MIN=15
+# shellcheck disable=SC2034
+MOTION_PIN=17 CEC=1 RESOLUTION=1920x1080@60 UPDATE_DAY='' OVERLAY_CORNER=bottom-right
+
+die() { echo "$*" >&2; exit 1; }
+
+# Known keys only; the conf is never run. Value: text after =, trimmed. A quoted value runs to the last matching
+# quote, else a space before # starts a note. CRLF and a missing final newline are fine; a later line wins.
+read_conf() {
+  local line k v q
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'} && line=${line#$'\xef\xbb\xbf'} # CRLF, and the UTF-8 BOM some editors put first
+    [[ $line == *=* ]] || continue
+    k=${line%%=*} v=${line#*=}
+    k=${k//[[:space:]]/}
+    [[ " $KEYS UPDATE_DAY " == *" $k "* ]] || continue
+    v=${v#"${v%%[![:space:]]*}"}
+    q=${v:0:1}
+    if [[ ($q == \" || $q == \') && ${v:1} == *"$q"* ]]; then
+      v=${v:1} && v=${v%"$q"*}
+    else
+      v=${v%%[[:space:]]#*} && v=${v%"${v##*[![:space:]]}"}
+      [[ $v != \#* ]] || v='' # KEY=   # note: the value is blank, not the note
+    fi
+    printf -v "$k" %s "$v"
+  done <"$CONF"
+}
+[ -r "$CONF" ] && read_conf
+# A bad hand edit falls back to the default instead of breaking the screen; tvlink set refuses the same values.
+[[ -z $BOARD_URL || $BOARD_URL =~ ^https?://[^[:space:]]+$ ]] ||
+  { echo "BOARD_URL ignored: not an http(s) link" >&2; BOARD_URL=''; }
+[[ $SLIDE_SECONDS =~ ^[1-9][0-9]{0,4}$ ]] || SLIDE_SECONDS=10
+[[ $CEC =~ ^[01]$ ]] || CEC=1
+[[ $RESOLUTION =~ ^([0-9]+x[0-9]+(@[0-9]+)?|auto)$ ]] || RESOLUTION=1920x1080@60
+[[ $UPDATE_DAY =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)?$ ]] ||
+  { echo "UPDATE_DAY ignored: not a day, eg Wed" >&2; UPDATE_DAY=''; }
+[[ $OVERLAY_CORNER =~ ^((top|bottom)-(left|right)|off)$ ]] || OVERLAY_CORNER=bottom-right
+
+# Settings as tvlink uses them, for tvlink-power, install.sh and people.
+show() {
+  local k
+  echo "VERSION=$VERSION"
+  for k in $KEYS UPDATE_DAY; do
+    if [[ $k == *_PSK && -n ${!k} ]]; then echo "$k=(set)"; else printf '%s=%s\n' "$k" "${!k}"; fi
+  done
+}
+
+# One probe: BOARD_URL answers below 500. Sets code.
+board_up() { code=$(curl -sS -o /dev/null -I -m 10 -w '%{http_code}' "$BOARD_URL") && [ "$code" -lt 500 ]; }
+
+# Splash state as JSONP for splash.html, written then renamed so it is never read half done. It carries the full URL
+# to navigate to; the splash only ever shows the host.
+STATUS=${TVLINK_STATUS:-/run/tvlink/status.js}
+put_status() { # state [http code] [files json]
+  local host=${BOARD_URL#*://} url=${BOARD_URL//\\/\\\\}
+  host=${host%%[/?#]*} host=${host##*@} url=${url//\"/\\\"}
+  printf 'tvlink({"state":"%s","code":"%s","host":"%s","url":"%s","name":"%s","ip":"%s","version":"%s",' \
+    "$1" "${2:-}" "${host//[\"\\]/}" "$url" "$(hostname)" "$(hostname -I 2>/dev/null | cut -d' ' -f1)" "$VERSION" \
+    >"$STATUS.tmp" &&
+    printf '"files":[%s],"secs":%d,"fit":"%s"})\n' "${3:-}" "$SLIDE_SECONDS" "${FIT//[^a-z]/}" >>"$STATUS.tmp" &&
+    mv "$STATUS.tmp" "$STATUS"
+}
+
+# Local content as a JSON list: images, videos or index.html in $CONTENT, by name. Skips dotfiles (eg macOS ._ copies).
+content() {
+  local f out=''
+  while IFS= read -r f; do
+    [[ $f == *[[:cntrl:]]* ]] && continue
+    f=${f//\\/\\\\} && out+="${out:+,}\"${f//\"/\\\"}\""
+  done < <(find "$CONTENT" -maxdepth 1 -type f ! -name '.*' \( -iname '*.jpg' -o -iname '*.jpeg' \
+    -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.svg' -o -iname '*.mp4' -o -iname '*.webm' \
+    -o -iname index.html \) 2>/dev/null | LC_ALL=C sort)
+  printf '%s' "$out"
+}
+
+# Feed the splash: hand over to the board only after a probe answers below 500 (never a browser error page); local
+# content while it does not, or with SOURCE=folder; else what it waits for. Rescans the folder, so new files show.
+status_loop() {
+  local delay=2 files state last='' seen=0
+  while :; do
+    files=$(content)
+    if [ "$SOURCE" != folder ] && [ -n "$BOARD_URL" ] && board_up; then state=ready code='' seen=1
+    elif [ -n "$files" ]; then state=folder # code kept: the badge tells a server error from no network
+    elif [ "$SOURCE" = folder ]; then state=empty code=''
+    elif [ -z "$BOARD_URL" ]; then state=setup code=''
+    elif [ -z "$(ip -4 route show default 2>/dev/null)" ]; then state=network code=''
+    else state=waiting
+    fi
+    put_status "$state" "$code" "$files"
+    if [ "$state $code" != "$last" ]; then echo "Splash: $state $code"; last="$state $code"; fi
+    sleep "$delay"
+    # Once the board has answered, keep probing every minute: the badge and any return to the splash use it.
+    delay=$((seen ? 60 : delay * 2 > 30 ? 30 : delay * 2))
+  done
+}
+
+# cage shows one app full screen, never blanks, and hides the cursor while no mouse is attached.
+kiosk() {
+  status_loop &
+  exec cage -- "$0" browser
+}
+
+# Set each output to RESOLUTION unless it already is; quiet: only say so when it changes something.
+set_mode() {
+  local out mode=$RESOLUTION rate=''
+  [[ $mode != *@* ]] || { mode+=Hz && rate=${RESOLUTION#*@}; }
+  [ "$RESOLUTION" != auto ] && command -v wlr-randr >/dev/null || return 0
+  for out in $(wlr-randr | awk '/^[^ ]/ {print $1}'); do
+    # Already at this size and (rounded) rate: leave it, so a 59.94 Hz TV is not reset every pass.
+    wlr-randr | awk -v o="$out" -v m="${RESOLUTION%@*}" -v r="$rate" '/^[^ ]/ {on = $1 == o}
+      on && /current/ && $1 == m && (r == "" || int($3 + 0.5) == r) {f = 1} END {exit !f}' && continue
+    if wlr-randr --output "$out" --mode "$mode"; then
+      [ -z "${1:-}" ] || echo "Set $out back to $mode"
+    elif [ -z "${1:-}" ]; then
+      echo "Can't set $out to $mode: keeping the TV's mode" >&2
+    fi
+  done
+}
+
+# Inside cage: set the output mode (cage takes the TV's preferred mode, eg 4K, and ignores video=), then hand over to
+# tvlink-agent, which runs Chromium. If the TV or cage refuses the mode, the TV's own mode stays and the log says so.
+browser() {
+  local browser
+  browser=$(command -v chromium || command -v chromium-browser) || die "Chromium not installed"
+  set_mode # tvlink-agent repeats it every 30 s: a TV that drops hotplug in standby comes back at its own mode
+  # Profile in RAM (the service's runtime dir); crash reports and Mesa's shader cache stay in /home/kiosk. No
+  # component downloads (Widevine, models, lists): some 90 MB at every start, which fills /run (10% of RAM) and
+  # breaks the network.
+  exec "${0%/*}/tvlink-agent" "$browser" --kiosk --incognito --noerrdialogs --no-first-run --password-store=basic \
+    --ozone-platform=wayland --user-data-dir=/run/tvlink/chromium --hide-scrollbars --disable-component-update \
+    --disable-features=Translate,OverscrollHistoryNavigation file:///usr/share/tvlink/splash.html
+}
+
+# CEC adapters to use; fails with a note when CEC=0 or none present.
+cec_devs() {
+  [ "$CEC" = 1 ] || { echo "CEC=0, skipping" >&2; return 1; }
+  compgen -G '/dev/cec*' || { echo "No CEC adapter, skipping" >&2; return 1; }
+}
+
+# One CEC message; true only when the TV took it. cec-ctl exits 0 either way, so read its report: a Sequence line
+# (sent) and no Tx or Rx error line under it.
+cec_send() { cec-ctl "$@" 2>&1 | awk '/Sequence:/ {s = 1} /^\t[TR]x/ {f = 1} END {exit !(s && !f)}'; }
+
+# on: wake a TV that does not report on, then claim its input. off: standby. A TV that dropped hotplug in standby
+# leaves the adapter with no address: cec-ctl then sends from Unregistered (15), and only Image View On gets through.
+tv() {
+  local devs dev pa
+  devs=$(cec_devs) || return 0
+  for dev in $devs; do
+    cec-ctl -d "$dev" --playback >/dev/null 2>&1
+    if [ "$1" = off ]; then
+      if cec_send -d "$dev" --to 0 --standby; then echo "$dev: standby sent"; else echo "$dev: no answer"; fi
+    elif cec-ctl -d "$dev" --to 0 --give-device-power-status 2>/dev/null | grep -qE 'pwr-state: (to-)?on'; then
+      echo "$dev: TV already on"
+    elif cec_send -d "$dev" --to 0 --image-view-on; then
+      pa=$(cec-ctl -d "$dev" | awk '/Physical Address/ {print $NF; exit}')
+      cec-ctl -d "$dev" --to 15 --active-source phys-addr="$pa" >/dev/null 2>&1
+      echo "$dev: TV woken"
+    else
+      echo "$dev: no answer"
+    fi
+  done
+}
+
+# on | standby | unknown, from the first CEC adapter that answers.
+status() {
+  local devs dev state
+  devs=$(cec_devs 2>/dev/null) || { echo unknown; return; }
+  for dev in $devs; do
+    cec-ctl -d "$dev" --playback >/dev/null 2>&1 || continue
+    state=$(cec-ctl -d "$dev" --to 0 --give-device-power-status 2>/dev/null | awk '/pwr-state:/ {print $2; exit}')
+    case $state in
+      on | to-on) echo on; return ;;
+      standby | to-standby) echo standby; return ;;
+    esac
+  done
+  echo unknown
+}
+
+# Wi-Fi networks from the conf as NetworkManager profiles in RAM only (save no), rebuilt at boot and on tvlink set,
+# so the conf stays the one place they live, also under the read-only overlay. Imager's own profile stays a fallback.
+net() {
+  local n ssid psk args seen
+  [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink net"
+  [ -z "$WIFI_COUNTRY" ] || iw reg set "$WIFI_COUNTRY" || echo "Can't set the Wi-Fi country to $WIFI_COUNTRY" >&2
+  # A unit imaged for Ethernet has the radio off until a country is set: NetworkManager turns it on and keeps it on.
+  [ -z "$WIFI1_SSID$WIFI2_SSID" ] || nmcli radio wifi on || echo "Can't turn Wi-Fi on" >&2
+  for n in 1 2; do
+    ssid=WIFI${n}_SSID psk=WIFI${n}_PSK seen=/run/tvlink-wifi$n
+    # Unchanged since the last run this boot: leave it alone, so the link (and a remote session on it) stays up. Both
+    # sides go through $(...), which drops the trailing newline an open network (blank PSK) leaves.
+    [ "$(cat "$seen" 2>/dev/null)" != "$(printf %s "${!ssid:+${!ssid}$'\n'${!psk}}")" ] || continue
+    nmcli connection delete "tvlink-wifi$n" >/dev/null 2>&1
+    rm -f "$seen"
+    [ -n "${!ssid}" ] || continue
+    # hidden yes: also joins networks that do not broadcast their name
+    args=(connection add save no type wifi con-name "tvlink-wifi$n" ifname wlan0 ssid "${!ssid}" wifi.hidden yes
+      connection.autoconnect-priority $((30 - 10 * n)))
+    [ -z "${!psk}" ] || args+=(wifi-sec.key-mgmt wpa-psk wifi-sec.psk "${!psk}")
+    if nmcli "${args[@]}" >/dev/null; then
+      (umask 077 && printf '%s\n%s' "${!ssid}" "${!psk}" >"$seen")
+      echo "Wi-Fi $n: ${!ssid}"
+    else
+      echo "Wi-Fi $n: can't add ${!ssid}" >&2
+    fi
+  done
+}
+
+# Health on one screen, for remote support and the hardware checklist. Read-only; sudo adds the CEC answers.
+doctor() {
+  local host=${BOARD_URL#*://} dev
+  host=${host%%[/?#]*} host=${host##*@}
+  echo "tvlink $VERSION on $(hostname), $(uptime -p 2>/dev/null), IP $(hostname -I 2>/dev/null)"
+  if [ -z "$BOARD_URL" ]; then echo "Board: none (SOURCE=$SOURCE)"
+  elif board_up; then echo "Board: $host answers HTTP $code"
+  else echo "Board: $host gives ${code:-no answer}"
+  fi
+  echo "Local files: $(content | tr ',' '\n' | grep -c .)"
+  echo "Services: $(systemctl is-active tvlink tvlink-power tvlink-net 2>/dev/null | paste -sd' ' -)," \
+    "next reboot $(systemctl show -p NextElapseUSecRealtime --value tvlink-reboot.timer 2>/dev/null)"
+  echo "Clock synced: $(timedatectl show -p NTPSynchronized --value 2>/dev/null)," \
+    "RTC $(date -d "@$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)" '+%F %T' 2>/dev/null)"
+  echo "Power and heat: $(vcgencmd get_throttled 2>/dev/null) $(vcgencmd measure_temp 2>/dev/null)"
+  echo "Memory: $(free -m 2>/dev/null | awk '/^Mem:/ {print $7 " MB free of " $2}')," \
+    "swap $(free -m 2>/dev/null | awk '/^Swap:/ {print $3 " MB used"}')"
+  echo "Disk free: boot $(df -h --output=avail /boot/firmware 2>/dev/null | tail -1)," \
+    "root $(df -h --output=avail / 2>/dev/null | tail -1)"
+  echo "HDMI: $(cat /sys/class/drm/card*-HDMI-A-*/status 2>/dev/null | paste -sd' ' -), TV $(status)"
+  for dev in /dev/cec*; do
+    [ -e "$dev" ] && echo "CEC $dev: address $(cec-ctl -d "$dev" 2>/dev/null | awk '/Physical Address/ {print $NF}')"
+  done
+  echo "Wi-Fi: $(nmcli -t -f NAME connection show --active 2>/dev/null | paste -sd' ' -)," \
+    "$(iw dev wlan0 get power_save 2>/dev/null)"
+  echo "Watchdog: $(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)," \
+    "root $(grep -q ' / overlay ' /proc/mounts 2>/dev/null && echo read-only || echo writable)"
+  echo "Versions: $(dpkg-query -W -f '${Package} ${Version}, ' cage chromium wlr-randr v4l-utils 2>/dev/null)"
+}
+
+# Hand a one-word request (identify, screenshot, reload) to tvlink-agent, which picks it up within a second. Written
+# as kiosk, who owns /run/tvlink: root never writes through a path the browser's user could have swapped for a link.
+ask() {
+  local req=${STATUS%/*}/request
+  [ -d "${STATUS%/*}" ] || die "The kiosk is not running"
+  [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink $1"
+  for _ in {1..5}; do [ -e "$req" ] || break; sleep 1; done # let an earlier request be taken first
+  # setsid: no controlling terminal, so the kiosk can't type into root's; timeout: a planted FIFO can't hold us.
+  # shellcheck disable=SC2016 # $1 and $2 belong to the inner sh
+  runuser -u kiosk -- timeout 5 setsid -w sh -c 'echo "$1" >"$2.tmp" && mv -fT "$2.tmp" "$2"' _ "$1" "$req" ||
+    die "Can't pass the request to the kiosk"
+}
+
+# What the TV shows now, as a JPEG in RAM. Waits up to 30 s for the agent; only a plain file counts, and it is never
+# opened here (the folder belongs to the kiosk user).
+screenshot() {
+  local shot=${STATUS%/*}/screen.jpg
+  rm -f "$shot" 2>/dev/null
+  ask screenshot
+  for _ in {1..30}; do
+    if [ -f "$shot" ] && [ ! -L "$shot" ] && [ -s "$shot" ]; then
+      echo "Saved $shot ($(du -k "$shot" | cut -f1) KB)"
+      return
+    fi
+    sleep 1
+  done
+  die "No screenshot after 30 s: see journalctl -t tvlink"
+}
+
+# Update from a release tarball: download, check its sha256, unpack, then run its install.sh as a transient unit,
+# so a dropped remote shell can't stop it halfway. Follow it with journalctl -u tvlink-update.
+update() {
+  local url=${1:-} sum=${2:-} dir inst
+  [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink update URL SHA256"
+  [[ $url =~ ^https:// && $sum =~ ^[0-9a-f]{64}$ ]] || die "Usage: sudo tvlink update https://.../tvlink.tar.gz SHA256"
+  dir=$(mktemp -d /var/tmp/tvlink-update.XXXXXX) || die "Can't make a working folder"
+  # shellcheck disable=SC2064 # expand now: dir is local and may be gone when the trap runs
+  trap "rm -rf '$dir'" EXIT # gone on any failure; the install unit removes it after a good run
+  curl -fsSL -m 300 -o "$dir/release.tar.gz" "$url" || die "Download failed: $url"
+  echo "$sum  $dir/release.tar.gz" | sha256sum -c --quiet || die "Checksum does not match: nothing installed"
+  tar -xzf "$dir/release.tar.gz" -C "$dir" || die "Can't unpack the release"
+  inst=$(find "$dir" -maxdepth 2 -name install.sh | head -n 1)
+  [ -n "$inst" ] || die "No install.sh in the release"
+  systemd-run --unit tvlink-update --collect -p ExecStopPost="/bin/rm -rf $dir" "$inst" >/dev/null ||
+    die "Can't start the install (another update still running?)"
+  trap - EXIT
+  echo "Installing from $dir: journalctl -u tvlink-update -f"
+}
+
+# Change settings in the conf (eg over a remote shell), then restart what uses them.
+set_conf() {
+  [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink set KEY=value"
+  [ $# -gt 0 ] || die "Usage: tvlink set KEY=value... (keys: $KEYS)"
+  local kv key value kiosk=0 net=0 power=0
+  for kv in "$@"; do # check every value before writing any
+    key=${kv%%=*} value=${kv#*=}
+    [[ $kv == *=* && $key =~ ^[A-Z0-9_]+$ && " $KEYS " == *" $key "* ]] || die "Unknown setting: $kv (keys: $KEYS)"
+    case $value in *"'"* | *$'\n'*) die "Value for $key can't contain ' or a newline" ;; esac
+    case $key in
+      BOARD_URL) [[ -z $value || $value =~ ^https?://[^[:space:]]+$ ]] ||
+        die "BOARD_URL is an http(s) link, eg https://example.com/d/KEY" ;;
+      POWER_MODE) [[ $value =~ ^(always|schedule|motion|manual|manual\+motion)$ ]] ||
+        die "POWER_MODE is always, schedule, motion, manual or manual+motion" ;;
+      TV_ON | TV_OFF) [[ -z $value || $value =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$key is HH:MM, eg 06:00" ;;
+      IDLE_MIN | MOTION_PIN) [[ $value =~ ^[0-9]+$ ]] || die "$key is a whole number" ;;
+      CEC) [[ $value =~ ^[01]$ ]] || die "CEC is 0 or 1" ;;
+      SOURCE) [[ $value =~ ^(auto|folder)$ ]] || die "SOURCE is auto or folder" ;;
+      SLIDE_SECONDS) [[ $value =~ ^[1-9][0-9]{0,4}$ ]] || die "SLIDE_SECONDS is 1 to 99999 seconds" ;;
+      FIT) [[ $value =~ ^(contain|cover)$ ]] || die "FIT is contain or cover" ;;
+      OVERLAY_CORNER) [[ $value =~ ^((top|bottom)-(left|right)|off)$ ]] ||
+        die "OVERLAY_CORNER is bottom-right, bottom-left, top-right, top-left or off" ;;
+      RESOLUTION) [[ $value =~ ^([0-9]+x[0-9]+(@[0-9]+)?|auto)$ ]] ||
+        die "RESOLUTION is WIDTHxHEIGHT@RATE, eg 1920x1080@60, or auto" ;;
+      WIFI_COUNTRY) [[ $value =~ ^([A-Z]{2})?$ ]] || die "WIFI_COUNTRY is a two-letter code, eg AU" ;;
+      WIFI?_SSID) (LC_ALL=C && [ ${#value} -le 32 ]) || die "$key is at most 32 bytes" ;;
+      WIFI?_PSK) [[ -z $value || ${#value} -ge 8 && ${#value} -le 63 ]] ||
+        die "$key is 8 to 63 characters, or blank for an open network" ;;
+    esac
+  done
+  touch "$CONF" || die "Can't write $CONF"
+  for kv in "$@"; do
+    key=${kv%%=*} value=${kv#*=}
+    # Write beside it, flush, rename, flush: a power cut leaves the old or the new conf (FAT has no journal, so
+    # in practice, not in theory). Values pass through ENVIRON, so backslashes stay literal.
+    # Keys match as read_conf reads them (spaces ignored), and every line for the key becomes one.
+    if ! k=$key v="$key='$value'" awk '{l = $0; sub(/=.*/, "", l); gsub(/[[:space:]]/, "", l)}
+      /=/ && l == ENVIRON["k"] {if (!f++) print ENVIRON["v"]; next} {print} END {if (!f) print ENVIRON["v"]}' \
+      "$CONF" >"$CONF.tmp" || ! sync "$CONF.tmp" || ! mv -f "$CONF.tmp" "$CONF" || ! sync -f "$CONF"; then
+      rm -f "$CONF.tmp"
+      die "Can't write $CONF"
+    fi
+    if [[ $key == *_PSK && -n $value ]]; then echo "$key=(set)"; else echo "$key=$value"; fi
+    case $key in
+      BOARD_URL | SOURCE | SLIDE_SECONDS | FIT | RESOLUTION | OVERLAY_CORNER) kiosk=1 ;;
+      WIFI*) net=1 ;;
+      *) power=1 ;;
+    esac
+  done
+  [ "$power" = 0 ] || systemctl restart tvlink-power
+  [ "$kiosk" = 0 ] || systemctl restart tvlink
+  [ "$net" = 0 ] || systemctl restart tvlink-net
+}
+
+case $1 in
+  check) # Nightly reboot gate: never in the first hour after boot (eg a timer fired by a clock jump). While a
+    # configured board is unreachable, skip for up to a week, so an outage keeps the last good board on screen.
+    read -r up _ <"${TVLINK_UPTIME:-/proc/uptime}"
+    ((${up%.*} > 3600)) || exit 1
+    [ "$(systemctl is-active apt-daily-upgrade.service 2>/dev/null)" != activating ] || exit 1 # upgrade running
+    [ "$SOURCE" = folder ] || [ -z "$BOARD_URL" ] || ((${up%.*} > 604800)) || board_up ;;
+  kiosk) kiosk ;;
+  browser) browser ;;
+  on | off) tv "$1" ;;
+  status) status ;;
+  show) show ;;
+  net) net ;;
+  doctor) doctor ;;
+  mode) set_mode quiet ;;
+  identify) ask identify && echo "Name and IP on screen for up to 60 s" ;;
+  reload) ask reload && echo "Reloading the page" ;;
+  screenshot) screenshot ;;
+  update) shift; update "$@" ;;
+  set) shift; set_conf "$@" ;;
+  *) die "Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|update URL SHA256|set KEY=value..." ;;
+esac

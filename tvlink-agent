@@ -1,0 +1,352 @@
+#!/usr/bin/python3 -s
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+"""Keeps the screen honest. Usage: tvlink-agent CHROMIUM [ARGS...] | tvlink-agent test
+
+Started by `tvlink browser` inside cage, as the kiosk user. It runs Chromium with the DevTools protocol on a pipe
+(no network port), then:
+- marks the board with a small corner badge (OVERLAY_CORNER): live with the network type and the time the board last
+  answered; Offline, Cached (the server failed, the page shows old content), Board not found or Clock not set when not
+  live. The state comes from the status loop in tvlink (/run/tvlink/status.js), so there is one prober.
+- recovers a crashed or frozen tab, or a Chromium error page, by going back to the splash, which hands over again once
+  the board answers; at most once a minute. After 3 recoveries in 10 min it exits: cage exits and systemd restarts
+  the kiosk with a fresh browser.
+Every 30 s it runs `tvlink mode`, which sets the HDMI mode again if the TV came back at its own (hotplug in
+standby). It also takes one-word requests from the tvlink CLI in /run/tvlink/request: identify (name and IP big
+on screen for up to 60 s, or until the page reloads), screenshot (JPEG to /run/tvlink/screen.jpg) and reload.
+It sends no CEC and needs no root.
+"""
+import base64
+import fcntl
+import json
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
+STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
+SPLASH = os.environ.get("TVLINK_SPLASH", "file:///usr/share/tvlink/splash.html")
+REQUEST = os.path.join(os.path.dirname(STATUS), "request")  # one word from `tvlink identify|screenshot|reload`
+SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
+SYNCED = os.environ.get("TVLINK_SYNCED", "/run/systemd/timesync/synchronized")  # timesyncd: NTP synced this boot
+RTC = "/sys/class/rtc/rtc0/since_epoch"
+CLOCK_FLOOR = 1793491200  # 2026-11-01, as in tvlink-power
+TICK, PUSH, HEALTH, MODE = 1, 15, 30, 30  # seconds: event poll, badge refresh, page health check, HDMI mode check
+
+# Runs in every document before the page's own scripts; the agent fills it in with __tvlinkOverlay(state).
+OVERLAY = r"""(() => {
+  if (location.protocol === "file:" || window !== window.top || window.__tvlinkOverlay) return;
+  const css = `div { display: flex; align-items: center; gap: .5em; font: 600 max(14px, .85vw)/1.2 system-ui,
+      "DejaVu Sans", sans-serif; color: #F4F6F8; background: rgba(14, 17, 22, .6); padding: .35em .7em;
+      border-radius: 1em; }
+    i { width: .7em; height: .7em; border-radius: 50%; background: #2FD07A; }
+    .warn { background: #F5A524; color: #0E1116; } .warn i { background: #0E1116; }
+    .bad { background: #F04438; color: #0E1116; } .bad i { background: #0E1116; }`;
+  let host, box, text, last;
+  window.__tvlinkOverlay = s => {
+    last = s;
+    if (!document.body) return;
+    if (!host || !host.isConnected) {
+      host = document.createElement("tvlink-overlay");
+      const root = host.attachShadow({mode: "closed"});
+      const sheet = new CSSStyleSheet();  // constructed, not a <style> tag or innerHTML: works under page CSP
+      sheet.replaceSync(css);
+      root.adoptedStyleSheets = [sheet];
+      [box, text] = [document.createElement("div"), document.createElement("span")];
+      box.append(document.createElement("i"), text);
+      root.append(box);
+      document.body.append(host);
+    }
+    const [v, h] = s.corner === "off" ? ["top", "left"] : s.corner.split("-");
+    host.style.cssText = `position: fixed; ${v}: 24px; ${h}: 24px; z-index: 2147483647; pointer-events: none;` +
+      (s.corner === "off" ? " display: none;" : "");
+    box.className = s.level;
+    text.textContent = s.text;
+  };
+  document.addEventListener("DOMContentLoaded", () => last && window.__tvlinkOverlay(last));
+})();"""
+
+
+# Name and IP across the screen for up to 60 s, on any page (CSP-safe: no innerHTML or style tags). %s is a JSON string.
+IDENTIFY = r"""(() => {
+  const host = document.createElement("tvlink-identify"), root = host.attachShadow({mode: "closed"});
+  const sheet = new CSSStyleSheet(), box = document.createElement("div");
+  sheet.replaceSync(`div { position: fixed; inset: 0; display: grid; place-items: center; text-align: center;
+    white-space: pre-line; background: rgba(14, 17, 22, .9); color: #F4F6F8;
+    font: 600 6vw/1.3 system-ui, "DejaVu Sans", sans-serif; }`);
+  root.adoptedStyleSheets = [sheet];
+  box.textContent = %s;
+  root.append(box);
+  host.style.cssText = "position: fixed; inset: 0; z-index: 2147483647; pointer-events: none;";
+  document.documentElement.append(host);
+  setTimeout(() => host.remove(), 60000);
+})();"""
+
+
+def take_request(path=REQUEST):
+    """The pending request from the CLI, removed so it runs once; empty if none."""
+    try:
+        with open(path) as f:
+            request = f.read().strip()
+        os.remove(path)
+        return request
+    except OSError:
+        return ""
+
+
+def settings(cli=CLI):
+    out = subprocess.run([cli, "show"], capture_output=True, text=True, errors="replace", timeout=60).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def read_status(path=STATUS):
+    """The status loop's last word: (state dict, write time), or ({}, None)."""
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read().strip()
+        return json.loads(text[text.index("(") + 1:text.rindex(")")]), os.path.getmtime(path)
+    except (OSError, ValueError):
+        return {}, None
+
+
+def network(route="/proc/net/route"):
+    """Wired, Wi-Fi or empty, from the interface of the default route."""
+    try:
+        with open(route) as f:
+            for line in f.read().splitlines()[1:]:
+                iface, dest = line.split()[:2]
+                if dest == "00000000":
+                    return "Wi-Fi" if iface.startswith("wl") else "Wired"
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def clock_ok():
+    if os.path.exists(SYNCED):
+        return True
+    try:
+        with open(RTC) as f:
+            return int(f.read()) > CLOCK_FLOOR
+    except (OSError, ValueError):
+        return False
+
+
+def badge(status, last_ok, net, page_status, clock):
+    """(level, text) for the corner: live, warn or bad. last_ok: HH:MM the board last answered, or None."""
+    shown = last_ok or "--:--"
+    if not clock:
+        return "warn", "Clock not set"
+    state, code = status.get("state"), status.get("code", "")
+    waiting = state in ("waiting", "folder")  # folder: local files took over while the board is down
+    if state == "network" or (waiting and code in ("", "000")):
+        return "bad", f"Offline, showing {shown}"
+    if waiting:
+        return "warn", f"Cached {shown}"
+    if page_status in (404, 410):
+        return "warn", "Board not found"
+    if state != "ready":
+        return "bad", f"Offline, showing {shown}"
+    return "live", f"{net} {shown}".strip()
+
+
+class Browser:
+    """Chromium on --remote-debugging-pipe: commands on its fd 3, answers and events on its fd 4, NUL-separated."""
+
+    def __init__(self, argv):
+        cmd_r, self.cmd_w = os.pipe()
+        self.resp_r, resp_w = os.pipe()
+
+        def fds():  # in the child: move both ends clear of 3 and 4 first, so neither overwrites the other
+            hi_r, hi_w = fcntl.fcntl(cmd_r, fcntl.F_DUPFD, 10), fcntl.fcntl(resp_w, fcntl.F_DUPFD, 10)
+            os.dup2(hi_r, 3)
+            os.dup2(hi_w, 4)
+
+        self.proc = subprocess.Popen(argv + ["--remote-debugging-pipe"], preexec_fn=fds, pass_fds=(3, 4))
+        os.close(cmd_r)
+        os.close(resp_w)
+        self.next_id, self.waiting, self.events, self.lock = 0, {}, queue.Queue(), threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        while chunk := os.read(self.resp_r, 1 << 16):
+            buf += chunk
+            while b"\0" in buf:
+                raw, buf = buf.split(b"\0", 1)
+                msg = json.loads(raw)
+                answer = self.waiting.pop(msg["id"], None) if "id" in msg else None
+                (answer or self.events).put(msg)
+        self.events.put(None)  # the browser has gone
+
+    def send(self, method, params=None, session=None, timeout=10):
+        with self.lock:
+            self.next_id += 1
+            msg_id, answer = self.next_id, queue.Queue(1)
+            self.waiting[msg_id] = answer
+            msg = {"id": msg_id, "method": method, "params": params or {}}
+            if session:
+                msg["sessionId"] = session
+            os.write(self.cmd_w, json.dumps(msg).encode() + b"\0")
+        msg = answer.get(timeout=timeout)  # queue.Empty: no answer in time
+        if "error" in msg:
+            raise RuntimeError(f"{method}: {msg['error'].get('message')}")
+        return msg.get("result", {})
+
+    def attach(self):
+        """Session on the page; the overlay goes into every document it loads from now on."""
+        for _ in range(60):
+            pages = [t for t in self.send("Target.getTargets", timeout=30)["targetInfos"] if t["type"] == "page"]
+            if pages:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("no page target")
+        session = self.send("Target.attachToTarget", {"targetId": pages[0]["targetId"], "flatten": True})["sessionId"]
+        for method in ("Page.enable", "Inspector.enable"):  # no Runtime.enable: its console events are not needed
+            self.send(method, session=session)
+        self.send("Page.addScriptToEvaluateOnNewDocument", {"source": OVERLAY}, session)
+        self.send("Runtime.evaluate", {"expression": OVERLAY}, session)
+        return session
+
+
+def main(argv):
+    conf = settings()
+    corner = conf.get("OVERLAY_CORNER") or "bottom-right"
+    browser = Browser(argv)
+    session = browser.attach()
+    last_ok, recoveries, next_push, next_health, shown = None, [], 0.0, time.monotonic() + HEALTH, None
+    hung, misses, href, page_status, next_mode = False, 0, "", 0, time.monotonic() + MODE
+    while True:
+        crashed = False
+        try:
+            event = browser.events.get(timeout=TICK)  # wait a tick for the first, then take what is queued
+            while True:
+                if event is None:
+                    print("Browser exited", flush=True)
+                    return 1
+                method, params = event.get("method"), event.get("params", {})
+                frame = params.get("frame", {})
+                if method == "Page.frameNavigated" and "parentId" not in frame:  # new page: check it, then badge it
+                    next_push, next_health, href, page_status = 0.0, 0.0, frame.get("url", ""), 0
+                crashed = crashed or method == "Inspector.targetCrashed"
+                event = browser.events.get_nowait()
+        except queue.Empty:
+            pass
+        now = time.monotonic()
+        status, written = read_status()
+        request = take_request()
+        try:
+            if request == "reload":
+                browser.send("Page.reload", {"ignoreCache": True}, session)
+            elif request == "screenshot":
+                shot = browser.send("Page.captureScreenshot", {"format": "jpeg", "quality": 70}, session)
+                with open(SCREEN + ".tmp", "wb") as f:
+                    f.write(base64.b64decode(shot["data"]))
+                os.replace(SCREEN + ".tmp", SCREEN)
+            elif request == "identify":
+                name = f"{status.get('name') or socket.gethostname()}\n{status.get('ip') or ''}".strip()
+                browser.send("Runtime.evaluate", {"expression": IDENTIFY % json.dumps(name), "returnByValue": True},
+                             session)
+            if request:
+                print(f"Request: {request}", flush=True)
+        except (queue.Empty, RuntimeError, OSError, KeyError, ValueError) as e:
+            print(f"Request {request} failed: {e}", flush=True)
+        if status.get("state") == "ready" and written:
+            last_ok = time.strftime("%H:%M", time.localtime(written))
+        if not crashed and now >= next_health:
+            next_health = now + HEALTH
+            try:
+                href, page_status = browser.send("Runtime.evaluate", {"returnByValue": True, "expression":
+                    "[location.href, performance.getEntriesByType('navigation')[0]?.responseStatus || 0]"},
+                    session)["result"]["value"]
+                href, page_status = str(href), page_status if type(page_status) is int else 0  # the page can lie
+                misses = 0
+            except queue.Empty:  # no answer; a slow load also blocks it, so only two in a row count as frozen
+                misses += 1
+            except (RuntimeError, KeyError, TypeError, ValueError):
+                pass  # eg the page was mid-navigation
+            hung = misses >= 2
+        # An empty 404 or 410 also shows as Chromium's error page: Board not found, not a failure to recover from.
+        broken = crashed or hung or (href.startswith("chrome-error:") and page_status not in (404, 410)) or (
+            page_status >= 500 and status.get("state") == "ready")
+        if broken and (not recoveries or now - recoveries[-1] >= 60):
+            recoveries = [t for t in recoveries if now - t < 600] + [now]
+            if len(recoveries) > 3:
+                print("Page keeps failing: restarting the browser", flush=True)
+                browser.proc.terminate()
+                return 1
+            why = "crashed" if crashed else "frozen" if hung else f"HTTP {page_status}" if page_status else "error page"
+            print(f"Recovering the page ({why})", flush=True)  # not href: the board link carries its key
+            try:
+                browser.send("Page.navigate", {"url": SPLASH}, session)
+            except (queue.Empty, RuntimeError):
+                pass
+            next_push, next_health, hung, misses, href, page_status = 0.0, now + 5, False, 0, "", 0
+        if now >= next_push and not hung:
+            next_push = now + PUSH
+            level, text = badge(status, last_ok, network(), page_status, clock_ok())
+            if (level, text.rstrip("0123456789:-")) != shown:  # log changes of state, not every new time
+                print(f"Badge: {level} {text}", flush=True)
+                shown = (level, text.rstrip("0123456789:-"))
+            state = json.dumps({"level": level, "text": text, "corner": corner})
+            try:
+                browser.send("Runtime.evaluate", {"expression": f"window.__tvlinkOverlay?.({state})",
+                                                  "returnByValue": True}, session)
+            except (queue.Empty, RuntimeError):
+                pass
+        if now >= next_mode:
+            next_mode = now + MODE
+            try:
+                subprocess.run([CLI, "mode"], timeout=20, check=False)
+            except subprocess.TimeoutExpired:
+                print("tvlink mode did not finish", flush=True)
+
+
+def test():
+    import tempfile
+    live = {"state": "ready"}
+    assert badge(live, "10:42", "Wired", 200, True) == ("live", "Wired 10:42")
+    assert badge(live, None, "", 200, True) == ("live", "--:--")
+    assert badge({"state": "network"}, "10:30", "", 0, True) == ("bad", "Offline, showing 10:30")
+    assert badge({"state": "waiting", "code": "000"}, "10:30", "Wi-Fi", 200, True)[0] == "bad"
+    assert badge({"state": "waiting", "code": "503"}, "10:30", "Wi-Fi", 200, True) == ("warn", "Cached 10:30")
+    assert badge(live, "10:42", "Wired", 404, True) == ("warn", "Board not found")
+    assert badge({"state": "folder"}, "10:30", "Wired", 200, True) == ("bad", "Offline, showing 10:30")
+    assert badge({"state": "folder", "code": "503"}, "10:30", "Wired", 200, True) == ("warn", "Cached 10:30")
+    assert badge({"state": "network"}, "10:30", "", 404, True)[0] == "bad"  # Offline beats Board not found
+    assert badge(live, "10:42", "Wired", 200, False) == ("warn", "Clock not set")
+    with tempfile.TemporaryDirectory() as tmp:
+        route = os.path.join(tmp, "route")
+        with open(route, "w") as f:
+            f.write("Iface\tDestination\tGateway\nwlan0\t0000A8C0\t00000000\nwlan0\t00000000\t0100A8C0\n")
+        assert network(route) == "Wi-Fi"
+        with open(route, "w") as f:
+            f.write("Iface\tDestination\tGateway\neth0\t00000000\t0100A8C0\n")
+        assert network(route) == "Wired"
+        with open(route, "w") as f:
+            f.write("Iface\tDestination\tGateway\n")
+        assert network(route) == ""
+        path = os.path.join(tmp, "status.js")
+        with open(path, "w") as f:
+            f.write('tvlink({"state":"waiting","code":"503","host":"a.example.com"})\n')
+        assert read_status(path)[0] == {"state": "waiting", "code": "503", "host": "a.example.com"}
+        assert read_status(os.path.join(tmp, "missing")) == ({}, None)
+        req = os.path.join(tmp, "request")
+        with open(req, "w") as f:
+            f.write("screenshot\n")
+        assert take_request(req) == "screenshot" and take_request(req) == ""  # runs once
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["test"]:
+        test()
+    elif len(sys.argv) > 1:
+        sys.exit(main(sys.argv[1:]))
+    else:
+        sys.exit(__doc__)
