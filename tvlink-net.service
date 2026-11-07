@@ -1,0 +1,14 @@
+[Unit]
+Description=tvlink Wi-Fi networks from tvlink.conf
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tvlink net
+# Never holds up the boot for long; the splash needs no network.
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target
