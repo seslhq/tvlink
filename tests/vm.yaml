@@ -1,0 +1,26 @@
+# Lima VM for tests/vm.sh: Debian 13 arm64 under Apple Virtualization, sized like a 1 GB Pi 5.
+# The generic image, not Lima's debian-13 template: its cloud kernel has no display, vivid or mac80211_hwsim.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+minimumLimaVersion: 2.0.0
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 1GiB
+disk: 16GiB
+images:
+- location: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2
+  arch: aarch64
+containerd: {system: false, user: false}
+mountType: virtiofs
+# A window shows tty1, where cage runs, as on the TV.
+video:
+  display: vz
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    # Debian 13 under Lima: LLMNR delays sshd at boot (as Lima's own debian-13 template does)
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\nLLMNR=no\n' >/etc/systemd/resolved.conf.d/10-lima-disable-llmnr.conf
+    systemctl restart systemd-resolved.service || true
