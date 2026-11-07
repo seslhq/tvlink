@@ -1,0 +1,12 @@
+[Unit]
+Description=tvlink planned nightly reboot
+
+[Service]
+Type=oneshot
+# Skips tonight in the first hour after boot, and while a configured board is unreachable (up to a week): a reboot
+# would swap the last good board for the splash. Local content and unconfigured units always reboot.
+ExecCondition=/usr/local/bin/tvlink check
+# Marks the reboot as planned, so POWER_MODE=manual does not treat it as a power cut and wake the TV.
+# Leading -: a write-protected boot partition must not block the reboot.
+ExecStart=-/bin/touch /boot/firmware/.tvlink-planned-reboot
+ExecStart=/bin/systemctl reboot

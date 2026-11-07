@@ -1,0 +1,9 @@
+[Unit]
+Description=tvlink nightly reboot
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Unit=tvlink-reboot.service
+
+[Install]
+WantedBy=timers.target
