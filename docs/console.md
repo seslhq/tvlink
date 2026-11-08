@@ -2,7 +2,8 @@
 
 Every unit hosts its own console: web pages and a JSON API on port 80, for the unit's status, settings, actions,
 logs, Wi-Fi, updates and API tokens. It works from a phone on the same network as the unit, or from anywhere through a
-tunnel in front of it. No other server is needed.
+tunnel in front of it ([Cloudflare](cloudflare.md)). No other server is needed; a [fleet console](fleet.md) can show
+many units in one place.
 
 ![The Status page: a screenshot of the TV, the screen state, TV power and health](images/console-status.png)
 
@@ -24,7 +25,7 @@ and prints a new code. API tokens keep working.
 
 | Page | Shows or does |
 | --- | --- |
-| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power, name, IP, version, uptime, and `tvlink doctor`'s health lines |
+| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power, the tunnel (off, connected or not connected), name, IP, version, uptime, and `tvlink doctor`'s health lines |
 | Settings | Every setting `tvlink set` takes, as a form built from `tvlink keys --json`; values are checked by `tvlink set` and errors show beside the field |
 | Actions | Reload Page, Identify, Take Screenshot, TV On, TV Off, and Reboot (asks first, on the page) |
 | Logs | The last 200 lines of the kiosk, TV power and Wi-Fi network logs |
@@ -34,8 +35,8 @@ and prints a new code. API tokens keep working.
 
 ![The Settings page: a form with one field per setting, each with its hint and default](images/console-settings.png)
 
-Passwords (`WIFI1_PSK`, `WIFI2_PSK`) are write-only: the page shows `(set)` or `(not set)`; a blank field keeps the
-current one, and Clear removes it.
+Secrets (`WIFI1_PSK`, `WIFI2_PSK`, `TUNNEL_TOKEN`) are write-only: the page shows `(set)` or `(not set)`; a blank field
+keeps the current one, and Clear removes it.
 
 ## Security
 
@@ -46,14 +47,16 @@ current one, and Clear removes it.
   and sudo does not log them (`set` can carry a Wi-Fi password).
 - **Login.** One password per unit, stored as a PBKDF2-SHA256 hash (600,000 rounds) readable only by the console user.
   Sessions are in memory (a restart logs everyone out) and expire after 12 hours. The cookie is `HttpOnly` and
-  `SameSite=Strict`, and `Secure` when the request came through an HTTPS proxy (`X-Forwarded-Proto: https`).
+  `SameSite=Strict`, and `Secure` when the request came through an HTTPS tunnel or proxy (`Cf-Visitor` says
+  `https`, or `X-Forwarded-Proto: https`).
 - **Forms.** Every change needs the session's CSRF token. Five wrong passwords or claim codes from one address in five
-  minutes (or 20 from all) lock logins out until the window passes.
+  minutes (or 20 from all) lock logins out until the window passes. Through cloudflared on the unit, the address is
+  the visitor's (`Cf-Connecting-IP`), taken only from loopback, so no one on the network can choose their own.
 - **Tokens.** Random 256-bit, shown once when made, stored as SHA-256 only. A token can do everything the console can,
   including updates, so give each fleet or script its own and revoke it when done.
 - **Plain HTTP.** On the local network, traffic (including the password) is not encrypted. For access from elsewhere
-  put a tunnel with HTTPS in front of it (eg Cloudflare Tunnel with Access); the console trusts no proxy header
-  except as the hint for the cookie's `Secure` flag.
+  put a tunnel with HTTPS in front of it: `TUNNEL_TOKEN` and Cloudflare Access ([Cloudflare](cloudflare.md)). No
+  header authenticates anyone, including those Access adds: every request needs a session or an API token.
 
 ## API
 
@@ -63,7 +66,7 @@ plus the `X-CSRF-Token` header on changes (every page sends the token in that re
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `uptime` (s), `health` (lines), `screenshot` (time taken, or null) |
+| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `tunnel` (`off`, `connected`, `not connected`), `uptime` (s), `health` (lines), `screenshot` (time taken, or null). `?brief=1`: `health` empty, in a fraction of the time |
 | `GET /api/settings` | | `version` and `keys`: `key`, `type` (`text`, `url`, `time`, `number`, `choice` with `choices`, `secret` with `set`), `label`, `hint`, `value`, `default` |
 | `POST /api/settings` | `{"KEY": "value", ...}` | `{"ok": true}`, or `400` with `error` and the `key` it is about |
 | `POST /api/action` | `{"action": "reload"}`: `reload`, `identify`, `screenshot`, `on`, `off` or `reboot` | `ok` and the command's `message` |

@@ -1,0 +1,33 @@
+# tvlink fleet console: every unit's console in one place, on any Linux box with Python 3 (docs/fleet.md). Listens on
+# 127.0.0.1:8080 for its own tunnel; TVLINK_CONSOLE_ADDR and TVLINK_CONSOLE_PORT (a drop-in) change that.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink fleet console
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/tvlink-console --fleet
+# A throwaway user; the password and units (with their tokens) in /var/lib/tvlink-fleet, the claim code in
+# /run/tvlink-fleet, readable by it and root only.
+DynamicUser=yes
+StateDirectory=tvlink-fleet
+StateDirectoryMode=0700
+RuntimeDirectory=tvlink-fleet
+RuntimeDirectoryMode=0700
+UMask=0077
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

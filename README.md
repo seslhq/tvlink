@@ -37,6 +37,13 @@ drops and browser crashes without a site visit.
 
   ![The console's Status page](docs/images/console-status.png)
 
+- **Reachable from anywhere.** One setting, `TUNNEL_TOKEN`, puts the console behind its own Cloudflare Tunnel with
+  HTTPS and Cloudflare Access in front: no open ports, no VPN ([docs/cloudflare.md](docs/cloudflare.md)).
+- **A fleet console, if you want one.** The same console in fleet mode, on any Linux server: every unit's screen,
+  badge, TV state and version on one page, and each unit's pages through its API ([docs/fleet.md](docs/fleet.md)).
+
+  ![The fleet overview](docs/images/fleet-overview.png)
+
 - **Managed remotely.** One text file on the SD card holds the settings, editable on any PC, in the console, or with
   `tvlink set` over Raspberry Pi Connect or SSH, which stay as a way in when the console can't be reached.
 
@@ -50,6 +57,7 @@ TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
                          tvlink-power.service    TV power over CEC: schedule, motion sensor, power-cut wake
                          tvlink-net.service      Wi-Fi networks from the settings file
                          tvlink-console.service  the console on port 80: web pages and JSON API
+                         tvlink-tunnel.service   optional: cloudflared, a Cloudflare Tunnel to the console
                          tvlink-reboot.timer     nightly reboot, gated on the page answering
                          /boot/firmware          tvlink.conf and the local content folder (FAT: any PC can edit it)
 ```
@@ -80,7 +88,7 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC), Wi-Fi and the
-motion sensor, and runs 59 checks against the real services: [docs/testing.md](docs/testing.md).
+motion sensor, and runs 103 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
@@ -89,6 +97,8 @@ motion sensor, and runs 59 checks against the real services: [docs/testing.md](d
 | [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor |
 | [Configuration](docs/configuration.md) | Every setting, power modes, local content |
 | [Console](docs/console.md) | The unit's web pages and JSON API, claiming, security |
+| [Cloudflare](docs/cloudflare.md) | A tunnel per unit, Access in front, a service token for the fleet console |
+| [Fleet](docs/fleet.md) | The fleet console: installing it on a server, adding units, security |
 | [Operations](docs/operations.md) | Remote management, updates, troubleshooting, on-site notes, replacing a unit |
 | [Design](docs/design.md) | How the parts fit, the decisions behind them, platform facts |
 | [Testing](docs/testing.md) | Checks, the VM harness, the checklist for real hardware |

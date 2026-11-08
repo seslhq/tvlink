@@ -185,6 +185,98 @@ check "API refuses a bad value, naming the key" test "$(web -H "X-CSRF-Token: $t
   /api/settings)/$(field key)" = 400/OVERLAY_CORNER
 check "claimed: the code is gone from the splash" within 60 splash_claim ''
 tvlink set OVERLAY_CORNER=bottom-right >/dev/null
+hdr=(-H 'Cf-Access-Authenticated-User-Email: someone@example.com' -H 'Cf-Access-Jwt-Assertion: x.y.z'
+  -H 'X-Forwarded-For: 192.0.2.9' -H 'X-Forwarded-User: admin')
+check "Access and proxy headers alone don't authenticate (API)" \
+  test "$(curl -s -o /dev/null -w '%{http_code}' "${hdr[@]}" http://127.0.0.1/api/status)" = 401
+check "... nor pages" test "$(curl -s -o /dev/null -w '%{http_code}' "${hdr[@]}" http://127.0.0.1/settings)" = 303
+cookie() { curl -s -D - -o /dev/null "$@" http://127.0.0.1/login | grep -i '^set-cookie:'; }
+check "cookie Secure behind a tunnel (Cf-Visitor)" grep -q '; Secure' <(cookie -H 'Cf-Visitor: {"scheme":"https"}')
+check "cookie Secure behind a proxy (X-Forwarded-Proto)" grep -q '; Secure' <(cookie -H 'X-Forwarded-Proto: https')
+check "cookie not Secure on plain HTTP" quiet test -z "$(cookie | grep '; Secure')"
+
+echo "== Tunnel (cloudflared with a made-up token)"
+tvlink set TUNNEL_TOKEN= >/dev/null # left by an earlier run; and cloudflared goes, so the install is checked each run
+apt-get purge -y -q cloudflared >/dev/null 2>&1
+rm -f /etc/apt/sources.list.d/cloudflared.list
+# Well formed (account, tunnel and secret), but no such tunnel: cloudflared reaches Cloudflare and is refused.
+fake=$(printf '{"a":"%032d","t":"00000000-0000-4000-8000-000000000000","s":"%s"}' 0 "$(head -c 32 /dev/zero |
+  base64)" | base64 -w0)
+since=$(date '+%F %T')
+check "a malformed token is refused" test "$(web -H "X-CSRF-Token: $t" -d '{"TUNNEL_TOKEN": "not-a-token"}' \
+  /api/settings)/$(field key)" = 400/TUNNEL_TOKEN
+check "set through the console API (as Settings does)" test "$(web -H "X-CSRF-Token: $t" \
+  -d "{\"TUNNEL_TOKEN\": \"$fake\"}" --max-time 300 /api/settings)" = 200
+check "... cloudflared installed from Cloudflare's repo" grep -q pkg.cloudflare.com <(apt-cache policy cloudflared)
+check "... token file root only" test "$(stat -c '%U %a' /etc/tvlink/tunnel-token)" = "root 600"
+check "... not in tvlink.conf" quiet test "$(grep -c TUNNEL /boot/firmware/tvlink.conf)" = 0
+check "... tvlink show says (set)" grep -qx 'TUNNEL_TOKEN=(set)' <(tvlink show)
+web /api/settings >/dev/null
+check "... the API says set, never the token" grep -qx 'True ' <(python3 -c 'import json, sys
+k = next(k for k in json.load(open(sys.argv[1]))["keys"] if k["key"] == "TUNNEL_TOKEN"); print(k["set"], k["value"])' \
+  "$c/body")
+check "tvlink-tunnel running" within 30 systemctl -q is-active tvlink-tunnel
+check "... the token is not on its command line" quiet test "$(pgrep -a cloudflared | grep -c -e "${fake:0:40}" \
+  -e '--token ')/$(pgrep -a cloudflared | grep -c -- '--token-file')" = 0/1
+check "... as its own unprivileged user" test -z "$(pgrep -u root -x cloudflared)"
+refused() { journalctl -q -u tvlink-tunnel --since "$since" | grep -q 'Register tunnel error'; }
+check "... cloudflared reaches Cloudflare and is refused" within 60 refused
+check "... state: not connected" test "$(tvlink tunnel)" = "not connected"
+check "... in tvlink doctor" grep -qx 'Tunnel: not connected' <(tvlink doctor)
+web /api/status >/dev/null
+check "... on the console's Status" test "$(field tunnel)" = "not connected"
+check "... the token is in no log" quiet test "$(journalctl -q --since "$since" | grep -c -F "${fake:0:40}")" = 0
+out=$(tvlink set TUNNEL_TOKEN=); check "clearing it says so" says '^TUNNEL_TOKEN=$'
+check "... stops the tunnel" quiet test "$(systemctl is-active tvlink-tunnel)/$(systemctl is-enabled tvlink-tunnel \
+  2>/dev/null)" = inactive/disabled
+check "... removes the token file" test ! -e /etc/tvlink/tunnel-token
+check "... state: off" test "$(tvlink tunnel)" = off
+
+echo "== Fleet console (port 8081, pointed at this unit's console)"
+install -m 644 tvlink-fleet.service /etc/systemd/system/
+mkdir -p /etc/systemd/system/tvlink-fleet.service.d
+printf '[Service]\nEnvironment=TVLINK_CONSOLE_PORT=8081\n' >/etc/systemd/system/tvlink-fleet.service.d/vm.conf
+systemctl daemon-reload
+systemctl stop tvlink-fleet
+rm -rf /var/lib/private/tvlink-fleet # a new fleet console each run
+systemctl start tvlink-fleet
+fweb() { curl -s -o "$c/body" -w '%{http_code}' -b "$c/fjar" -c "$c/fjar" "${@:1:$#-1}" "http://127.0.0.1:8081${!#}"; }
+check "fleet: running" within 10 quiet fweb /login
+check "fleet: on loopback only" quiet test "$(ss -Htln 'sport = :8081' | awk '{print $4}')" = 127.0.0.1:8081
+check "fleet: claim code readable by root only" test "$(stat -c %a /run/tvlink-fleet/claim)" = 600
+fweb /claim >/dev/null
+check "fleet: claimed with its code" test "$(fweb -d "csrf=$(csrf)" -d "code=$(cat /run/tvlink-fleet/claim)" \
+  -d password=vm-fleet-password -d repeat=vm-fleet-password /claim)" = 303
+web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-fleet >/dev/null
+web -H "X-CSRF-Token: $t" -d '{"name": "vm-fleet"}' /api/tokens >/dev/null
+token=$(field token)
+fweb /units/new >/dev/null
+f=$(csrf)
+check "fleet: adds the unit" test "$(fweb -d "csrf=$f" -d name=vm-unit -d url=http://127.0.0.1 -d "token=$token" \
+  /units/new)" = 303
+check "... stored for the fleet user only" test "$(stat -c %a /var/lib/private/tvlink-fleet/units.json)" = 600
+fweb -d "csrf=$f" -d name=vm-down -d url=http://192.0.2.1 -d "token=tvl_$(printf %032d 0)" /units/new >/dev/null
+start=$(date +%s)
+check "fleet: overview" test "$(fweb /)" = 200
+check "... the unit is live" grep -q 'class="pill live">Live<' "$c/body"
+check "... a unit that is down shows as unreachable" grep -q '>Unreachable<' "$c/body"
+check "... and doesn't hold up the page" test $(($(date +%s) - start)) -le 6
+check "fleet: Take Screenshot through it" test "$(fweb -d "csrf=$f" -d action=screenshot -d back=/u/vm-unit/ \
+  /u/vm-unit/actions)" = 303
+check "fleet: the unit's Status page" test "$(fweb /u/vm-unit/)" = 200
+check "... with its health" grep -q 'Tunnel: off' "$c/body"
+check "... and its screenshot" test "$(fweb /u/vm-unit/screenshot.jpg)" = 200
+since=$(date '+%F %T')
+check "fleet: an action through it" test "$(fweb -d "csrf=$f" -d action=reload /u/vm-unit/actions)" = 303
+check "... the page reloads" within 10 logged 'Request: reload'
+check "fleet: the unit's Settings page" test "$(fweb /u/vm-unit/settings)" = 200
+check "... a bad value comes back with its error" test "$(fweb -d "csrf=$f" -d OVERLAY_CORNER=middle \
+  /u/vm-unit/settings)" = 400
+check "fleet: the unit's Logs page" test "$(fweb /u/vm-unit/logs)" = 200
+rm -f "$c/fjar"
+check "fleet: refused without a login" test "$(fweb /u/vm-unit/)" = 303
+web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-fleet >/dev/null
+systemctl stop tvlink-fleet
 
 echo "== $fails failed"
 [ "$fails" = 0 ]

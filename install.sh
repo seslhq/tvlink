@@ -15,11 +15,12 @@ apt-get update
 apt-get install -y --no-upgrade cage wlr-randr chromium v4l-utils unattended-upgrades curl python3-gpiozero \
   python3-lgpio sudo
 
-# Daily security updates, plus the Raspberry Pi repo that ships Chromium.
+# Daily security updates, plus the Raspberry Pi repo that ships Chromium, and Cloudflare's for cloudflared on units
+# with a tunnel (tvlink set TUNNEL_TOKEN adds it).
 cat >/etc/apt/apt.conf.d/52tvlink <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
-Unattended-Upgrade::Origins-Pattern { "origin=Raspberry Pi Foundation"; };
+Unattended-Upgrade::Origins-Pattern { "origin=Raspberry Pi Foundation"; "origin=cloudflared"; };
 EOF
 
 # The browser runs as kiosk: never an admin account. Its seat (cage, via logind) needs only render, and it may not
@@ -44,7 +45,7 @@ install -m 440 tvlink-console.sudoers /etc/sudoers.d/tvlink-console
 
 install -m 755 tvlink tvlink-power tvlink-agent tvlink-console /usr/local/bin/
 install -m 644 tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.service tvlink-reboot.timer \
-  tvlink-console.service /etc/systemd/system/
+  tvlink-console.service tvlink-tunnel.service /etc/systemd/system/
 install -D -m 644 splash.html /usr/share/tvlink/splash.html
 [ -e "$CONF" ] || install -m 644 tvlink.conf.example "$CONF"
 install -d "$BOOT/tvlink" # local content, see SOURCE
@@ -91,7 +92,7 @@ grep -q '^disable_splash=1' "$BOOT/config.txt" || printf '\n[all]\ndisable_splas
 systemctl daemon-reload
 systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer tvlink-console.service
 # An update takes effect now; a first install starts at the next boot, except the console, so it can be claimed now.
-systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service
+systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service tvlink-tunnel.service
 systemctl restart tvlink-console.service
 
 echo "Installed tvlink $(./tvlink show | sed -n 's/^VERSION=//p'). First install: set BOARD_URL if needed, then reboot."

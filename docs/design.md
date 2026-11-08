@@ -24,6 +24,8 @@ page itself (eg pixel shift or a night theme), captive portals and WPA-Enterpris
 | `tvlink-power` | root | The only user of CEC and the motion sensor: power modes, clock trust, power-cut handling |
 | `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
 | `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
+| `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
+| `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
 | `tvlink check` | root | Gate for the nightly reboot timer |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
 
@@ -82,6 +84,24 @@ badge state in over the DevTools pipe instead.
   the console: its commands then run as from a root shell. sudo does not log these commands, since `tvlink set` can
   carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from
   parsing human output; the settings form is built from `tvlink keys --json`, so a new key shows up by itself.
+- **Tunnel: Cloudflare, one per unit, opt-in.** `TUNNEL_TOKEN` is the only setting: a unit without it has no
+  cloudflared and no extra apt repo, so behaviour is unchanged. Setting it installs cloudflared from Cloudflare's own
+  apt repo on demand (not in install.sh: most units never need it, and the token is set after install anyway), and
+  unattended-upgrades then keeps it current with the staged updates. The token lives in `/etc/tvlink`, root-only,
+  not on the FAT card any PC can read; systemd passes it to cloudflared (a `DynamicUser`) as a credential file for
+  `--token-file`, so it is never on a command line. Remotely managed tunnels keep the hostname and the route to
+  `http://localhost:80` in the dashboard, so the unit holds one secret and no tunnel config. cloudflared's `/ready`
+  on loopback gives the state for `tvlink doctor` and the console. A tunnel per unit, not one shared: each can be
+  revoked alone, and each unit gets a first-level hostname that Cloudflare's free certificate covers.
+- **No trusted headers.** Cloudflare Access is a gate in front, not the console's login: a session or an API token is
+  always needed. Headers only decide the cookie's `Secure` flag (`Cf-Visitor`, `X-Forwarded-Proto`) and, from
+  loopback only, which visitor the login limit counts (`Cf-Connecting-IP`).
+- **Fleet mode in the same file.** `tvlink-console --fleet` serves the same pages for any unit: the page code takes its
+  data from a backend with the same calls, `LOCAL` (this unit, through `tvlink`) or `Remote` (a unit's JSON API with
+  its API token and an Access service token), so there is one set of forms and one place to fix them. The fleet keeps
+  its own password, claim code and units list (fleet user only), never follows redirects (they would carry the
+  tokens), and asks all units at once with a 4 s cap, keeping what each said last in memory. It needs nothing but
+  Python 3, so it runs on any server; it listens on loopback for its own tunnel.
 - **Logins kept simple.** One password per unit (PBKDF2-SHA256), sessions in memory, a CSRF token on every change, a
   login rate limit, and per-unit API tokens stored hashed for fleet tools. No accounts, no roles: anyone who can log
   in can do everything, including updates.

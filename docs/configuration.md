@@ -13,7 +13,7 @@ tvlink show
 
 After a hand edit, reboot or run `sudo systemctl restart tvlink tvlink-power tvlink-net`. Put notes on their own
 line starting with `#`; quote values with spaces or `#`. `tvlink show` prints what tvlink actually reads, with
-passwords masked. The file is only ever read, never run, and a bad value falls back to its default.
+passwords and the tunnel token masked. The file is only ever read, never run, and a bad value falls back to its default.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -32,6 +32,7 @@ passwords masked. The file is only ever read, never run, and a bad value falls b
 | `WIFI_COUNTRY` | (blank) | Wi-Fi country code, eg `AU`. Blank keeps the one set in Imager. |
 | `WIFI1_SSID`, `WIFI1_PSK` | (blank) | A Wi-Fi network and its password (blank password: an open network). Hidden networks work. |
 | `WIFI2_SSID`, `WIFI2_PSK` | (blank) | A second network, eg the next one when a site changes its Wi-Fi. |
+| `TUNNEL_TOKEN` | (blank) | A Cloudflare Tunnel token: the console from anywhere over HTTPS ([Cloudflare](cloudflare.md)). Kept root-only in `/etc/tvlink/tunnel-token`, never in this file; set and cleared only with `tvlink set` or the console. Blank: no tunnel. |
 | `UPDATE_DAY` | (blank) | Blank: security updates every night (canary units). `Mon` to `Sun`: weekly on that day, after the canaries. Applied by rerunning install.sh. |
 
 Pages are best designed at 1920x1080: 1080p keeps a 4K TV sharp enough and the Pi cool. A mode the TV refuses is

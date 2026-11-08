@@ -14,8 +14,10 @@ python3 tvlink-console test
 ```
 
 The self-tests cover the settings parser (through `tvlink show`), the power modes, presence and clock logic (including
-clock changes), the badge, and the console's password hashing, sessions, CSRF tokens, login rate limit, settings
-forms and API tokens.
+clock changes), the badge, and the console's password hashing, sessions, CSRF tokens, login rate limit (and the
+visitor's address through a tunnel), settings forms and API tokens; and the fleet console's unit checks, its calls to
+stand-in units (the tokens it sends, redirects refused, each failure's message), the overview not waiting on a slow
+or dead unit, and its badges.
 
 ## The VM
 
@@ -47,6 +49,8 @@ tests/vm.sh
 | Motion sensor | gpiozero's MockFactory, through a tvlink-power drop-in; GPIO17 follows the line written to the FIFO | `echo 1 >/run/pir17` (motion), `echo 0` (quiet) |
 | Board | `python3 -m http.server` on 127.0.0.1:8080 | `systemctl stop tvlink-test-board` |
 | GPU | wlroots software renderer (`WLR_RENDERER=pixman` drop-in) | |
+| Cloudflare Tunnel | The real cloudflared from Cloudflare's repo, with a made-up token that Cloudflare refuses (the VM needs internet) | `tvlink set TUNNEL_TOKEN=...` |
+| Fleet server | The VM itself: `tvlink-fleet.service` on port 8081 (a drop-in), pointed at the unit's console on `http://127.0.0.1` | `curl http://127.0.0.1:8081/...` |
 
 `tests/vm-test.sh` checks:
 - install and the self-tests;
@@ -64,7 +68,18 @@ tests/vm.sh
   header refused, the API refused with no session or token, the console user unable to run other commands as root,
   an API token (stored hashed only) reloading the page and fetching the screenshot, then revoked and refused, a
   settings round trip through the API (`OVERLAY_CORNER`, not logged by sudo, a bad value refused with its key), and
-  the claim code gone from the splash once claimed. The checks use curl against `http://127.0.0.1` inside the VM.
+  the claim code gone from the splash once claimed. The checks use curl against `http://127.0.0.1` inside the VM;
+- the console behind a tunnel: Access and proxy headers alone don't authenticate, and the cookie is `Secure` with
+  `Cf-Visitor` or `X-Forwarded-Proto` saying HTTPS, and not otherwise;
+- the tunnel: a malformed token refused; a made-up one set through the console API installs cloudflared from
+  Cloudflare's repo, is stored root-only and not in tvlink.conf, shows only as `(set)`, and starts `tvlink-tunnel`
+  (not as root, the token not on its command line); Cloudflare refuses it and `tvlink tunnel`, `tvlink doctor` and the
+  console's status say `not connected`; the token is in no log; clearing it stops and disables the service and
+  removes the file;
+- the fleet console: on loopback only, a root-only claim code, claimed; this unit added with an API token (stored for
+  the fleet user only) and an unreachable one (`192.0.2.1`); the overview shows the unit Live and the other
+  Unreachable without waiting on it; the screenshot, Status (with health), Settings (a bad value's error) and Logs
+  pages through the fleet; a Reload through it reaches the TV; nothing without a login.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
@@ -115,5 +130,12 @@ or after a change that touches them, check on the bench with a fresh card and re
 - Console from a phone on the site Wi-Fi: `http://<name>.local` resolves (else the IP), the claim code on the TV
   works once, every page reads well on a phone, the Status screenshot matches the TV, Reboot comes back on its own,
   an update from the Update page restarts the console, and a login takes under 2 s (PBKDF2 on the Pi).
+- Tunnel, with a real Cloudflare account ([Cloudflare](cloudflare.md)): the dashboard's token from the console's
+  Settings installs cloudflared and says `Tunnel: connected` within a minute; the hostname opens the console over
+  HTTPS behind Access, and logging in works (the cookie is `Secure`); it reconnects after a reboot and after the
+  network drops; a revoked token says `not connected`; clearing the token stops it.
+- Fleet console on a Debian or Ubuntu server behind its own tunnel and Access ([fleet](fleet.md)): units added with a
+  service token show Live; a unit unplugged shows Unreachable at the next look without slowing the page; a wrong
+  service token says to check it; Settings and Actions through the fleet reach the unit.
 
 Reports from your own hardware are welcome as issues: the Pi model, the TV model, and which of these passed.

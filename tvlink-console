@@ -1,18 +1,24 @@
 #!/usr/bin/python3 -s
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
-"""The unit console: web pages and a JSON API for one tvlink unit. Usage: tvlink-console | tvlink-console test
+"""The unit console: web pages and a JSON API for one tvlink unit. Usage: tvlink-console [--fleet] | tvlink-console test
 
 Runs as the tvlink-console user (tvlink-console.service) on port 80. Until a password is set it is in claim mode: only
 the claim page, which needs the one-time code on the TV's splash (also `sudo tvlink console claim`). Root only through
 sudo, for the tvlink commands in /etc/sudoers.d/tvlink-console; nothing from a request reaches a shell.
 Pages: a session cookie, and a CSRF token on every change. API (/api/*): an API token (Authorization: Bearer), or a
 session plus the X-CSRF-Token header on changes. Sessions live in memory: a restart logs everyone out.
+--fleet: the fleet console, on any Linux box (tvlink-fleet.service, port 8080 on loopback, behind its own tunnel). The
+same pages for every unit, through each unit's API with its API token (and a Cloudflare Access service token); its
+own password, claim code (/run/tvlink-fleet/claim) and units list (/var/lib/tvlink-fleet), fleet user only.
 """
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import html
+import http.client
+import ipaddress
 import json
 import os
 import re
@@ -23,16 +29,22 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import urllib.error
+import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
 SUDO = os.environ.get("TVLINK_SUDO", "/usr/bin/sudo")
-STATE = os.environ.get("TVLINK_CONSOLE_STATE", "/var/lib/tvlink-console")  # password and tokens, console user only
-RUN = os.environ.get("TVLINK_CONSOLE_RUN", "/run/tvlink-console")  # the claim code, read by the splash
+FLEET = sys.argv[1:2] == ["--fleet"]
+_mode = "fleet" if FLEET else "console"
+STATE = os.environ.get("TVLINK_CONSOLE_STATE", f"/var/lib/tvlink-{_mode}")  # password, tokens or units: ours only
+RUN = os.environ.get("TVLINK_CONSOLE_RUN", f"/run/tvlink-{_mode}")  # the claim code, read by the splash on a unit
 STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
-PORT = int(os.environ.get("TVLINK_CONSOLE_PORT", "80"))
+PORT = int(os.environ.get("TVLINK_CONSOLE_PORT", "8080" if FLEET else "80"))
+ADDR = os.environ.get("TVLINK_CONSOLE_ADDR", "127.0.0.1" if FLEET else "::")  # the fleet: only its tunnel reaches it
 SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
 ITERATIONS = 600_000  # PBKDF2-SHA256, OWASP's 2023 figure
 MIN_PASSWORD = 10
@@ -222,7 +234,7 @@ def save(changes):
     for k, v in changes.items():
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", k) or not isinstance(v, str):
             return False, f"Unknown setting: {k}", None
-    ok, out, err = tvlink("set", *(f"{k}={v}" for k, v in changes.items()), timeout=120)
+    ok, out, err = tvlink("set", *(f"{k}={v}" for k, v in changes.items()), timeout=300)  # a first tunnel: apt
     if ok:
         return True, "Saved", None
     msg = err or out or "Can't save"
@@ -269,18 +281,20 @@ def duration(secs):
     return f"{d} d {h} h" if d else f"{h} h {m} min" if h else f"{m} min"
 
 
-def status():
+def status(brief=False):
+    """The unit's state; brief: without doctor's health lines, which can take seconds (the fleet page)."""
     s = read_status()
     _, tv, _ = tvlink("status", timeout=30)
-    _, doctor, err = tvlink("doctor", timeout=60)
+    _, tunnel, _ = tvlink("tunnel", root=False, timeout=10)
+    _, doctor, err = (True, "", "") if brief else tvlink("doctor", timeout=60)
     _, shot = screen()
     label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
     if s.get("code") and s.get("code") != "000" and s.get("state") in ("waiting", "folder"):
         label += f" (HTTP {s['code']})"
     return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": schema().get("version"),
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
-            "tv": tv or "unknown", "uptime": uptime(), "health": (doctor or err).splitlines(),
-            "screenshot": int(shot) if shot else None}
+            "tv": tv or "unknown", "tunnel": tunnel or "unknown", "uptime": uptime(),
+            "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
 
 
 def networks():
@@ -306,6 +320,229 @@ def logs(which=LOGS):
     return {w: (lambda r: r[1] or r[2])(tvlink("logs", w)) for w in which}
 
 
+def action(name):
+    """(ok, message) of one of ACTIONS."""
+    ok, out, err = tvlink(name, timeout=60)
+    return ok, out or err or ("Done" if ok else "Failed")
+
+
+def update(url, sha256):
+    ok, out, err = tvlink("update", url, sha256, timeout=330)
+    return ok, out or err or "Failed"
+
+
+# What the pages show and do, for this unit; in fleet mode a Remote with the same calls, through the unit's API.
+LOCAL = types.SimpleNamespace(status=status, schema=schema, save=save, action=action, screen=screen, logs=logs,
+                              networks=networks, update=update)
+
+
+# Fleet mode: units reached through their API
+
+class UnitError(Exception):
+    """A unit that did not answer, or not as a tvlink console: the message says what to check."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # never: a redirect would carry the unit's tokens to wherever it points
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+SEEN, SHOTS, BUSY = {}, {}, {}  # per unit: last answer {time, status}; last screenshot (time, JPEG); fetch under way
+# ponytail: in memory, so last seen starts over when the fleet restarts; keep it in a file if that matters.
+POOL = concurrent.futures.ThreadPoolExecutor(16)
+
+
+def unit_from_form(form):
+    """A unit to store from the Units form, checked: name, url, token, access_id, access_secret. Raises ValueError."""
+    u = {k: (form.get(k) or "").strip() for k in ("name", "url", "token", "access_id", "access_secret")}
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", u["name"]):
+        raise ValueError("Name is 1 to 40 letters, digits, dots, dashes or underscores, eg tv-lobby-01")
+    url = urlsplit(u["url"])
+    try:
+        url.port
+    except ValueError:
+        raise ValueError("The port in the URL is not a number")
+    if url.scheme not in ("http", "https") or not url.hostname or "@" in url.netloc or url.query or url.fragment \
+            or not re.fullmatch(r"[A-Za-z0-9.:\[\]/_-]+", u["url"]):
+        raise ValueError("URL is the unit's address, eg https://tv-lobby-01.example.com")
+    u["url"] = u["url"].rstrip("/")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,200}", u["token"]):
+        raise ValueError("API token is the one made on the unit's API Tokens page, eg tvl_...")
+    if bool(u["access_id"]) != bool(u["access_secret"]):
+        raise ValueError("A Cloudflare Access service token needs both its client ID and its secret")
+    for k in ("access_id", "access_secret"):
+        if not re.fullmatch(r"[\x21-\x7e]{0,200}", u[k]):  # header values: printable, no spaces
+            raise ValueError("The Access client ID and secret have no spaces")
+    return u
+
+
+class Units:
+    """The fleet's units by name, with the tokens to reach them: one JSON file, readable by the fleet user only."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+
+    def load(self):
+        try:
+            return json.loads(read_file(self.path) or "{}")
+        except ValueError:
+            return {}
+
+    def add(self, unit):
+        with self.lock:
+            units = self.load()
+            if unit["name"] in units:
+                raise ValueError(f"A unit named {unit['name']} already exists: remove it first to change it")
+            units[unit.pop("name")] = unit
+            write_file(self.path, json.dumps(units, indent=1))
+
+    def remove(self, name):
+        with self.lock:
+            units = self.load()
+            if units.pop(name, None) is None:
+                return False
+            write_file(self.path, json.dumps(units, indent=1))
+        SEEN.pop(name, None)
+        SHOTS.pop(name, None)
+        return True
+
+
+class Remote:
+    """One unit through its console's API, with the same calls as LOCAL, so the same pages serve both."""
+
+    def __init__(self, name, unit):
+        self.name, self.u = name, unit
+
+    def call(self, method, path, body=None, timeout=15):
+        """(HTTP code, body bytes, content type). Raises UnitError when there is no usable answer."""
+        headers = {"Authorization": f"Bearer {self.u['token']}", "User-Agent": "tvlink-fleet"}
+        if self.u.get("access_id"):  # Cloudflare Access service token
+            headers |= {"CF-Access-Client-Id": self.u["access_id"], "CF-Access-Client-Secret": self.u["access_secret"]}
+        data = None if body is None else json.dumps(body).encode()
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.u["url"] + path, data, headers, method=method)
+        try:
+            with OPENER.open(req, timeout=timeout) as r:
+                return r.status, r.read(16 * 2**20), r.headers.get_content_type()
+        except urllib.error.HTTPError as err:
+            code, ctype, where = err.code, err.headers.get_content_type(), err.headers.get("Location", "")
+            text = err.read(65536)
+        except (OSError, http.client.HTTPException, ValueError) as err:  # URLError and timeouts are OSErrors
+            why = getattr(err, "reason", err)
+            raise UnitError(f"No answer from {self.name}: {getattr(why, 'strerror', None) or why}")
+        if 300 <= code < 400:
+            raise UnitError(f"{self.name} sent us to a login page" + (": check its Cloudflare Access service token"
+                            if "cloudflareaccess.com" in where else f" ({code})"))
+        if code == 401 and ctype == "application/json":
+            raise UnitError(f"{self.name} refused its API token: make a new one on its API Tokens page")
+        if ctype != "application/json":
+            raise UnitError(f"{self.name} answered HTTP {code}, not as a tvlink console" +
+                            (": check its Cloudflare Access service token" if code == 403 else ""))
+        return code, text, ctype
+
+    def json(self, method, path, body=None, timeout=15):
+        code, text, ctype = self.call(method, path, body, timeout)
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if ctype != "application/json" or not isinstance(data, dict):
+            raise UnitError(f"{self.name} answered HTTP {code}, not as a tvlink console")
+        return code, data
+
+    def status(self, brief=False, timeout=30):
+        code, s = self.json("GET", "/api/status" + ("?brief=1" if brief else ""), timeout=timeout)
+        if code != 200 or not isinstance(s.get("health", []), list):
+            raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
+        SEEN[self.name] = {"time": time.time(), "status": s}
+        return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
+                "tv": "unknown", "tunnel": "", "uptime": 0, "health": [], "screenshot": None, **s}
+
+    def schema(self):
+        code, s = self.json("GET", "/api/settings")
+        if code != 200 or not isinstance(s.get("keys"), list):
+            raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
+        return s
+
+    def save(self, changes):
+        if not changes:
+            return True, "Nothing changed", None
+        code, r = self.json("POST", "/api/settings", changes, timeout=330)
+        return (True, r.get("message", "Saved"), None) if code == 200 else (False, r.get("error", ""), r.get("key"))
+
+    def action(self, name):
+        code, r = self.json("POST", "/api/action", {"action": name}, timeout=90)
+        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+
+    def update(self, url, sha256):
+        code, r = self.json("POST", "/api/update", {"url": url, "sha256": sha256}, timeout=360)
+        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+
+    def logs(self, which=LOGS):
+        code, r = self.json("GET", "/api/logs")
+        return {w: str(r.get(w, "")) for w in which}
+
+    def networks(self):
+        return self.json("GET", "/api/wifi")[1].get("networks", [])
+
+    def screen(self):
+        """(JPEG, time) of the unit's last screenshot, fetched once per screenshot; the last one we have when it is
+        down."""
+        taken, have = (SEEN.get(self.name) or {}).get("status", {}).get("screenshot"), SHOTS.get(self.name)
+        if have and (have[0] == taken or not taken):
+            return have[1], have[0]
+        try:
+            code, data, ctype = self.call("GET", "/api/screenshot", timeout=15)
+        except UnitError:
+            return (have[1], have[0]) if have else (None, None)
+        if code != 200 or ctype != "image/jpeg":
+            return None, None
+        SHOTS[self.name] = (taken, data)
+        return data, taken
+
+
+def poll(units, wait=4.0):
+    """Every unit's brief status at once: {name: (status or None, error)}. Waits at most `wait` s in all, so a unit
+    that is down never holds up the page; a slow answer still lands in SEEN for the next look."""
+    for name, u in units.items():
+        if name not in BUSY or BUSY[name].done():  # one fetch per unit at a time, however often the page loads
+            BUSY[name] = POOL.submit(Remote(name, u).status, True, 20)
+    jobs = {name: BUSY[name] for name in units}
+    concurrent.futures.wait(jobs.values(), timeout=wait)
+    out = {}
+    for name, job in jobs.items():
+        if not job.done():
+            out[name] = None, "No answer yet"
+        elif job.exception():
+            out[name] = None, str(job.exception())
+        else:
+            out[name] = job.result(), ""
+    return out
+
+
+def badge(s):
+    """(level, label) for a unit on the fleet page: as the badge on its TV says it, or Unreachable."""
+    if s is None:
+        return "bad", "Unreachable"
+    state, code, board = s.get("state"), s.get("code") or "", s.get("host")
+    if state == "ready":
+        return "live", "Live"
+    if state == "network" or (state in ("waiting", "folder") and board and code in ("", "000")):
+        return "bad", "Offline"
+    if state in ("waiting", "folder") and board:
+        return "warn", "Cached"
+    if state == "folder":
+        return "live", "Local Content"
+    return "warn", STATES.get(state, state or "Unknown")
+
+
+def ago(t, now=None):
+    secs = int((now or time.time()) - t)
+    return "Just now" if secs < 60 else f"{duration(secs)} ago"
+
+
 def claimed():
     return os.path.exists(os.path.join(STATE, "password"))
 
@@ -320,7 +557,7 @@ def claim_code():
         code = (read_file(path) or "").strip()
         if not code and not claimed():
             code = new_code()
-            write_file(path, code + "\n", 0o644)  # the splash (kiosk user) shows it
+            write_file(path, code + "\n", 0o600 if FLEET else 0o644)  # on a unit the splash (kiosk user) shows it
         return code
 
 
@@ -350,6 +587,7 @@ MARK = ('<svg viewBox="0 0 174 110" aria-hidden="true"><rect x="7" y="10" width=
         'stroke="currentColor" stroke-width="14"/><circle cx="141" cy="74" r="12" fill="#2FD07A"/></svg>')
 NAV = (("/", "Status"), ("/settings", "Settings"), ("/actions", "Actions"), ("/logs", "Logs"), ("/wifi", "Wi-Fi"),
        ("/update", "Update"), ("/tokens", "API Tokens"))
+FLEET_NAV = (("/", "Overview"), ("/units", "Units"))
 CSS = """:root { --ink: #0E1116; --paper: #F4F6F8; --muted: #9AA4B2; --live: #2FD07A; --warn: #F5A524; --bad: #F04438;
   --panel: #171B22; --line: #2A303A; color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -408,28 +646,20 @@ table { width: 100%; border-collapse: collapse; } th, td { text-align: left; pad
   border-bottom: 1px solid var(--line); } th { color: var(--muted); font-weight: 400; }
 main:has(> .narrow) { max-width: 26rem; margin-top: 2rem; }
 .secret { font-family: ui-monospace, monospace; }
+a.button { color: var(--ink); background: var(--paper); border-radius: .4rem; padding: .5rem 1rem; font-weight: 600;
+  text-decoration: none; display: inline-block; }
+header .unit a { color: inherit; text-decoration: none; }
+.units { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); }
+.units .card { display: flex; flex-direction: column; gap: .5rem; text-decoration: none; }
+.units .card:hover { border-color: var(--muted); } .units img, .units .noshot { width: 100%; border-radius: .4rem; }
+.units img { aspect-ratio: 16 / 9; object-fit: cover; background: #000; } .units dl { font-size: .9rem; }
+.units .stale img { opacity: .5; }
 @media (max-width: 40rem) { header { padding: .75rem; } nav { flex-basis: 100%; } main { padding: 1rem .75rem; } }
 """
 
 
 def csrf_input(sess):
     return f'<input type="hidden" name="csrf" value="{e(sess["csrf"])}">'
-
-
-def page(title, body, sess=None, path="", flash="", bad=False):
-    name = e(socket.gethostname())
-    nav = ""
-    if sess and sess["auth"]:
-        links = "".join(f'<a href="{href}"{" aria-current=page" if href == path else ""}>{label}</a>'
-                        for href, label in NAV)
-        nav = (f'<nav>{links}<form method="post" action="/logout">{csrf_input(sess)}'
-               '<button class="quiet">Log Out</button></form></nav>')
-    flash = f'<div class="flash{" bad" if bad else ""}" role="status">{e(flash)}</div>' if flash else ""
-    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{e(title)} · {name}</title><link rel="stylesheet" href="/console.css"></head><body>'
-            f'<header><span class="unit">{MARK}{name}</span>{nav}</header>'
-            f'<main><h1>{e(title)}</h1>{flash}{body}</main></body></html>')
 
 
 def field(k, value=None, error=""):
@@ -482,9 +712,8 @@ def settings_form(keys, sess, action, form=None, error="", error_at=None, extra=
             f'<button>Save</button></form>')
 
 
-def page_keys(wifi):
-    sch = schema()
-    return sch, [k for k in sch["keys"] if k["key"].startswith("WIFI") == wifi]
+def page_keys(sch, wifi):
+    return [k for k in sch.get("keys", []) if k["key"].startswith("WIFI") == wifi]
 
 
 # HTTP
@@ -493,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version, sys_version = "tvlink-console", ""
     timeout = 60  # a client that stops sending frees its thread
     sessions, limiter, tokens = Sessions(), Limiter(), Tokens(os.path.join(STATE, "tokens.json"))
+    units = Units(os.path.join(STATE, "units.json"))  # fleet mode
 
     def do_GET(self):
         self.route("GET")
@@ -531,8 +761,42 @@ class Handler(BaseHTTPRequestHandler):
     def redirect(self, to, cookie=None):
         self.reply(303, "", headers=[("Location", to)] + ([("Set-Cookie", cookie)] if cookie else []))
 
+    def page(self, title, body, path="", flash="", bad=False):
+        """A whole page. path: where it is, below self.base (in fleet mode /u/NAME for a unit's pages)."""
+        nav = ""
+        if self.sess and self.sess["auth"]:
+            links = "".join(f'<a href="{href}"{" aria-current=page" if href == self.base + path else ""}>{label}</a>'
+                            for href, label in self.nav)
+            nav = (f'<nav>{links}<form method="post" action="/logout">{csrf_input(self.sess)}'
+                   '<button class="quiet">Log Out</button></form></nav>')
+        label = e(self.name)
+        if FLEET:
+            label = '<a href="/">Fleet</a>' + (f" / {label}" if self.base else "")
+        flash = f'<div class="flash{" bad" if bad else ""}" role="status">{e(flash)}</div>' if flash else ""
+        return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+                f'<title>{e(title)} · {e(self.name)}</title><link rel="stylesheet" href="/console.css"></head><body>'
+                f'<header><span class="unit">{MARK}{label}</span>{nav}</header>'
+                f'<main><h1>{e(title)}</h1>{flash}{body}</main></body></html>')
+
+    def https(self):
+        """Whether the browser came over HTTPS, through a tunnel or proxy: only ever for the cookie's Secure flag."""
+        visitor = self.headers.get("Cf-Visitor", "").replace(" ", "")  # Cloudflare: {"scheme":"https"}
+        return self.headers.get("X-Forwarded-Proto", "").lower() == "https" or '"scheme":"https"' in visitor
+
+    def client_ip(self):
+        """The peer, or for a request through cloudflared on this machine, the visitor Cloudflare names: so the login
+        limit counts each visitor, not the tunnel. Only from loopback: no one on the network can pick their own."""
+        peer = self.client_address[0].removeprefix("::ffff:")
+        try:
+            if ipaddress.ip_address(peer).is_loopback:
+                return str(ipaddress.ip_address(self.headers.get("Cf-Connecting-IP", "").strip()))
+        except ValueError:
+            pass
+        return peer
+
     def cookie(self, sid):
-        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""  # behind a tunnel
+        secure = "; Secure" if self.https() else ""
         return f"tvlink={sid}; Path=/; HttpOnly; SameSite=Strict{secure}"
 
     def start_session(self, auth):
@@ -577,20 +841,24 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self.sid = jar["tvlink"].value if "tvlink" in jar else None
         self.sess = self.sessions.get(self.sid)
+        self.unit, self.base, self.name = LOCAL, "", "Fleet" if FLEET else socket.gethostname()
+        self.nav = FLEET_NAV if FLEET else NAV
         try:
             if path == "/console.css":
                 return self.reply(200, CSS, "text/css; charset=utf-8")
-            if path.startswith("/api/"):
+            if path.startswith("/api/") and not FLEET:
                 return self.api(method, path, query)
             return self.pages(method, path)
         except ValueError as err:
             return self.reply(400, str(err), "text/plain; charset=utf-8")
+        except UnitError as err:  # fleet mode: the unit did not answer as it should
+            return self.reply(502, self.page("Can't Reach the Unit", f"<p>{e(str(err))}</p>"))
 
     def csrf_ok(self, given):
         return bool(self.sess and given and hmac.compare_digest(str(given), self.sess["csrf"]))
 
     def pages(self, method, path):
-        ip = self.client_address[0]
+        ip = self.client_ip()
         if method not in ("GET", "POST"):
             return self.reply(405, "Method not allowed", "text/plain")
         if not claimed():
@@ -607,17 +875,29 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST":
             form = self.form()
             if not self.csrf_ok(form.get("csrf")):
-                return self.reply(403, page("Expired Form", '<p>The form expired or came from another site. '
-                                            '<a href="/">Start again</a>.</p>', self.sess))
-        handler = {"/": self.status_page, "/settings": self.settings_page, "/wifi": self.wifi_page,
-                   "/actions": self.actions_page, "/logs": self.logs_page, "/update": self.update_page,
-                   "/tokens": self.tokens_page, "/logout": self.logout, "/screenshot.jpg": self.screenshot}.get(path)
+                return self.reply(403, self.page("Expired Form", '<p>The form expired or came from another site. '
+                                                 '<a href="/">Start again</a>.</p>'))
+        unit = {"/": self.status_page, "/settings": self.settings_page, "/wifi": self.wifi_page,
+                "/actions": self.actions_page, "/logs": self.logs_page, "/update": self.update_page,
+                "/screenshot.jpg": self.screenshot}
+        if FLEET:  # its own pages, and every unit's pages under /u/NAME, through the unit's API
+            handler = {"/": self.fleet_page, "/units": self.units_page, "/units/new": self.unit_new_page}.get(path)
+            m = re.fullmatch(r"/u/([^/]+)(/.*)?", path)
+            if m and m[1] in (units := self.units.load()):
+                if not m[2]:
+                    return self.redirect(f"/u/{m[1]}/")
+                self.unit, self.base, self.name = Remote(m[1], units[m[1]]), f"/u/{m[1]}", m[1]
+                self.nav = [(self.base + href, label) for href, label in NAV if href != "/tokens"]
+                handler, path = unit.get(m[2]), m[2]
+        else:
+            handler = {**unit, "/tokens": self.tokens_page}.get(path)
+        handler = self.logout if path == "/logout" and not self.base else handler
         if not handler:
-            return self.reply(404, page("Not Found", '<p><a href="/">Back to Status</a></p>', self.sess))
+            return self.reply(404, self.page("Not Found", '<p><a href="/">Back</a></p>'))
         return handler(method, form)
 
     def claim_page(self, method, ip):
-        cookie, msg = self.anon(), ""
+        cookie, msg, title = self.anon(), "", "Claim This Console" if FLEET else "Claim This Unit"
         claim_code()
         if method == "POST":
             form = self.form()
@@ -631,8 +911,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.redirect("/", self.start_session(True))
                 if msg == "Wrong claim code":
                     self.limiter.fail(ip)
-        body = (f'<div class="narrow"><p>This unit has no password yet. Enter the code shown on its TV (or from '
-                f'<code>sudo tvlink console claim</code>) and choose the console password.</p>'
+        where = (f"the code from <code>sudo cat {e(RUN)}/claim</code> on the fleet server" if FLEET else
+                 "the code shown on its TV (or from <code>sudo tvlink console claim</code>)")
+        body = (f'<div class="narrow"><p>This {"fleet console" if FLEET else "unit"} has no password yet. Enter '
+                f'{where} and choose the console password.</p>'
                 f'<form method="post" action="/claim" class="card">{csrf_input(self.sess)}'
                 f'<div class="field"><label for="code">Claim Code</label><input id="code" name="code" '
                 f'autocomplete="off" autocapitalize="characters" placeholder="ABC-123" required></div>'
@@ -640,9 +922,9 @@ class Handler(BaseHTTPRequestHandler):
                 f'name="password" autocomplete="new-password" minlength="{MIN_PASSWORD}" required>'
                 f'<p class="hint">At least {MIN_PASSWORD} characters.</p></div>'
                 f'<div class="field"><label for="repeat">Repeat Password</label><input type="password" id="repeat" '
-                f'name="repeat" autocomplete="new-password" required></div><button>Claim This Unit</button>'
+                f'name="repeat" autocomplete="new-password" required></div><button>{title}</button>'
                 f'</form></div>')
-        self.reply(400 if msg else 200, page("Claim This Unit", body, self.sess, flash=msg, bad=True),
+        self.reply(400 if msg else 200, self.page(title, body, flash=msg, bad=True),
                    headers=[("Set-Cookie", cookie)] if cookie else [])
 
     def login_page(self, method, ip):
@@ -660,12 +942,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.limiter.fail(ip)
                 msg = "Wrong password"
+        reset = (f"On the fleet server: <code>sudo rm {e(STATE)}/password</code>, restart tvlink-fleet and claim it"
+                 " again"
+                 if FLEET else "On the unit: <code>sudo tvlink console reset</code>")
         body = (f'<div class="narrow"><form method="post" action="/login" class="card">{csrf_input(self.sess)}'
                 f'<div class="field"><label for="password">Password</label><input type="password" id="password" '
                 f'name="password" autocomplete="current-password" autofocus required></div>'
-                f'<button>Log In</button></form><p class="hint">Forgotten it? On the unit: '
-                f'<code>sudo tvlink console reset</code>.</p></div>')
-        self.reply(401 if msg else 200, page("Log In", body, self.sess, flash=msg, bad=True),
+                f'<button>Log In</button></form><p class="hint">Forgotten it? {reset}.</p></div>')
+        self.reply(401 if msg else 200, self.page("Log In", body, flash=msg, bad=True),
                    headers=[("Set-Cookie", cookie)] if cookie else [])
 
     def logout(self, method, form):
@@ -675,37 +959,40 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect("/login", "tvlink=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")
 
     def screenshot(self, method, form):
-        data, _ = screen()
+        data, _ = self.unit.screen()
         if data is None:
             return self.reply(404, "No screenshot yet", "text/plain")
         self.reply(200, data, "image/jpeg")
 
     def status_page(self, method, form):
-        s = status()
+        s = self.unit.status()
         flash, bad = self.take_flash()
         level = "live" if s["state"] == "ready" else "bad" if s["state"] == "network" else ""
-        shot = (f'<img src="/screenshot.jpg?{s["screenshot"]}" alt="What the TV shows">' if s["screenshot"]
+        shot = (f'<img src="{self.base}/screenshot.jpg?{s["screenshot"]}" alt="What the TV shows">' if s["screenshot"]
                 else '<div class="noshot">No screenshot yet</div>')
         taken = time.strftime("Taken %H:%M:%S", time.localtime(s["screenshot"])) if s["screenshot"] else ""
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
-                ("TV", e(s["tv"].capitalize())), ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
+                ("TV", e(s["tv"].capitalize())), ("Tunnel", e(s.get("tunnel", "").capitalize())),
+                ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
         body = (f'<div class="grid"><figure>{shot}<figcaption><span>{taken}</span>'
-                f'<form method="post" action="/actions">{csrf_input(self.sess)}<input type="hidden" name="back" '
-                f'value="/"><button class="quiet" name="action" value="screenshot">Take Screenshot</button></form>'
+                f'<form method="post" action="{self.base}/actions">{csrf_input(self.sess)}<input type="hidden" '
+                f'name="back" value="{self.base}/"><button class="quiet" name="action" value="screenshot">'
+                f'Take Screenshot</button></form>'
                 f'</figcaption></figure><section><dl>'
                 + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
                 + f'</dl></section></div><h2>Health</h2><pre>{e(chr(10).join(s["health"]))}</pre>')
-        self.reply(200, page("Status", body, self.sess, "/", flash, bad))
+        self.reply(200, self.page("Status", body, "/", flash, bad))
 
     def settings_page(self, method, form, wifi=False):
         path, title = ("/wifi", "Wi-Fi") if wifi else ("/settings", "Settings")
-        sch, keys = page_keys(wifi)
+        sch = self.unit.schema()
+        keys = page_keys(sch, wifi)
         flash, bad, error, at = "", False, "", None
         if method == "POST":
-            ok, msg, at = save(form_changes(keys, form))
+            ok, msg, at = self.unit.save(form_changes(keys, form))
             if ok:
-                return self.flash_back(path, msg)
+                return self.flash_back(self.base + path, msg)
             if at:
                 error, flash = msg, "Not saved: see below"
             else:
@@ -716,7 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
             form = None
         extra, body = "", ""
         if wifi:
-            nets = networks()
+            nets = self.unit.networks()
             extra = '<datalist id="ssids">' + "".join(f'<option value="{e(n["ssid"])}">' for n in nets) + "</datalist>"
             rows = "".join(f'<tr><td>{e(n["ssid"])}</td><td>{n["signal"]}%</td><td>{e(n["security"])}</td></tr>'
                            for n in nets) or '<tr><td colspan="3">None seen</td></tr>'
@@ -728,9 +1015,9 @@ class Handler(BaseHTTPRequestHandler):
             intro = "<p>Saved to tvlink.conf on the SD card; the parts that use a setting restart by themselves.</p>"
         if sch.get("error"):
             flash, bad = sch["error"], True
-        form_html = settings_form(keys, self.sess, path, form, error, at, extra)
+        form_html = settings_form(keys, self.sess, self.base + path, form, error, at, extra)
         self.reply(400 if bad and method == "POST" else 200,
-                   page(title, intro + form_html + body, self.sess, path, flash, bad))
+                   self.page(title, intro + form_html + body, path, flash, bad))
 
     def wifi_page(self, method, form):
         self.settings_page(method, form, wifi=True)
@@ -738,11 +1025,11 @@ class Handler(BaseHTTPRequestHandler):
     def actions_page(self, method, form):
         if method == "POST":
             action, back = form.get("action", ""), form.get("back")
-            back = back if back in ("/", "/actions") else "/actions"
+            back = back if back in (self.base + "/", self.base + "/actions") else self.base + "/actions"
             if action not in ACTIONS:
                 return self.flash_back(back, f"Unknown action: {action}", True)
-            ok, out, err = tvlink(action, timeout=60)
-            return self.flash_back(back, out or err or ("Done" if ok else "Failed"), not ok)
+            ok, msg = self.unit.action(action)
+            return self.flash_back(back, msg, not ok)
         flash, bad = self.take_flash()
         cards = [("reload", "Reload Page", "Reloads the page on the TV."),
                  ("identify", "Identify", "The unit's name and IP across the TV for up to a minute."),
@@ -751,35 +1038,37 @@ class Handler(BaseHTTPRequestHandler):
                  ("off", "TV Off", "Puts the TV in standby. The power mode may wake it again.")]
         csrf = csrf_input(self.sess)
         body = '<div class="actions">' + "".join(
-            f'<form method="post" action="/actions" class="card">{csrf}<strong>{label}</strong><p>{hint}</p>'
+            f'<form method="post" action="{self.base}/actions" class="card">{csrf}<strong>{label}</strong><p>{hint}</p>'
             f'<button name="action" value="{a}">{label}</button></form>' for a, label, hint in cards)
         body += (f'<div class="card"><strong>Reboot</strong><p>The TV shows the splash for about a minute.</p>'
                  f'<details><summary class="button danger"><span class="closed">Reboot</span><span class="open">Cancel'
-                 f'</span></summary><form method="post" action="/actions" class="row">{csrf}<span>Reboot now?</span>'
+                 f'</span></summary><form method="post" action="{self.base}/actions" class="row">{csrf}'
+                 f'<span>Reboot now?</span>'
                  f'<button class="danger" name="action" value="reboot">Reboot Now</button></form></details></div>'
                  f'</div>')
-        self.reply(200, page("Actions", body, self.sess, "/actions", flash, bad))
+        self.reply(200, self.page("Actions", body, "/actions", flash, bad))
 
     def logs_page(self, method, form):
         names = {"kiosk": "Kiosk", "power": "TV Power", "net": "Wi-Fi Networks"}
-        body = "".join(f"<h2>{names[w]}</h2><pre>{e(text) or 'Nothing yet'}</pre>" for w, text in logs().items())
-        self.reply(200, page("Logs", "<p>The last 200 lines of each, newest last.</p>" + body, self.sess, "/logs"))
+        body = "".join(f"<h2>{names[w]}</h2><pre>{e(text) or 'Nothing yet'}</pre>"
+                       for w, text in self.unit.logs().items())
+        self.reply(200, self.page("Logs", "<p>The last 200 lines of each, newest last.</p>" + body, "/logs"))
 
     def update_page(self, method, form):
         if method == "POST":
-            ok, out, err = tvlink("update", form.get("url", "").strip(), form.get("sha256", "").strip().lower(),
-                                  timeout=330)
-            return self.flash_back("/update", out or err or "Failed", not ok)
+            ok, msg = self.unit.update(form.get("url", "").strip(), form.get("sha256", "").strip().lower())
+            return self.flash_back(self.base + "/update", msg, not ok)
         flash, bad = self.take_flash()
         csrf = csrf_input(self.sess)
-        body = (f'<p>Installed: tvlink {e(schema().get("version") or "")}. Install a commit of main by its archive URL '
-                f'and SHA-256; a wrong checksum installs nothing.</p><form method="post" action="/update" '
+        body = (f'<p>Installed: tvlink {e(self.unit.schema().get("version") or "")}. Install a commit of main by its '
+                f'archive URL and SHA-256; a wrong checksum installs nothing.</p><form method="post" '
+                f'action="{self.base}/update" '
                 f'class="card">{csrf}<div class="field"><label for="url">Archive URL</label><input id="url" '
                 f'name="url" inputmode="url" placeholder="https://github.com/seslhq/tvlink/archive/COMMIT.tar.gz" '
                 f'required></div><div class="field"><label for="sha256">SHA-256</label><input id="sha256" '
                 f'name="sha256" autocomplete="off" pattern="[0-9a-fA-F]{{64}}" required><p class="hint">On your '
                 f'computer: <code>curl -sL URL | shasum -a 256</code></p></div><button>Install</button></form>')
-        self.reply(200, page("Update", body, self.sess, "/update", flash, bad))
+        self.reply(200, self.page("Update", body, "/update", flash, bad))
 
     def tokens_page(self, method, form):
         flash, bad, made = "", False, ""
@@ -809,7 +1098,72 @@ class Handler(BaseHTTPRequestHandler):
                 f'<h2>New Token</h2><form method="post" action="/tokens" class="card">{csrf}<div class="field">'
                 f'<label for="name">Name</label><input id="name" name="name" maxlength="40" placeholder="fleet" '
                 f'required></div><button>Create Token</button></form>')
-        self.reply(400 if bad and method == "POST" else 200, page("API Tokens", body, self.sess, "/tokens", flash, bad))
+        self.reply(400 if bad and method == "POST" else 200, self.page("API Tokens", body, "/tokens", flash, bad))
+
+    # Fleet mode
+
+    def fleet_page(self, method, form):
+        units = self.units.load()
+        if not units:
+            return self.reply(200, self.page("Fleet", '<p>No units yet. <a href="/units/new">Add the first one</a>: '
+                                             'its address and an API token made in its console.</p>', "/"))
+        cards = []
+        for name, (s, err) in sorted(poll(units).items()):
+            seen = SEEN.get(name)
+            last = s or (seen or {}).get("status") or {}  # down: what it said last
+            level, label = badge(s)
+            shot = (f'<img src="/u/{e(name)}/screenshot.jpg?{e(str(last["screenshot"]))}" alt="What {e(name)} shows">'
+                    if last.get("screenshot") else '<div class="noshot">No screenshot</div>')
+            rows = [("TV", e(str(last.get("tv", "")).capitalize() or "Unknown")),
+                    ("Last Seen", ago(seen["time"]) if seen else "Not since the fleet started"),
+                    ("Version", e(str(last.get("version") or "Unknown")))]
+            cards.append(f'<a class="card{" stale" if s is None else ""}" href="/u/{e(name)}/">{shot}<strong>{e(name)}</strong>'
+                         f'<span class="pill {level}">{e(label)}</span>'
+                         + (f'<p class="hint">{e(err)}</p>' if err else "")
+                         + "<dl>" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows) + "</dl></a>")
+        self.reply(200, self.page("Fleet", f'<div class="units">{"".join(cards)}</div>', "/"))
+
+    def units_page(self, method, form):
+        if method == "POST":
+            name = form.get("remove", "")
+            ok = self.units.remove(name)
+            return self.flash_back("/units", f"Removed {name}" if ok else "No such unit", not ok)
+        flash, bad = self.take_flash()
+        csrf = csrf_input(self.sess)
+        rows = "".join(
+            f'<tr><td><a href="/u/{e(n)}/">{e(n)}</a></td><td>{e(u["url"])}</td>'
+            f'<td>{"Yes" if u.get("access_id") else "No"}</td><td><details><summary class="button quiet">'
+            f'<span class="closed">Remove</span><span class="open">Cancel</span></summary>'
+            f'<form method="post" action="/units" class="row">{csrf}<button class="danger" name="remove" '
+            f'value="{e(n)}">Remove {e(n)}</button></form></details></td></tr>'
+            for n, u in sorted(self.units.load().items())) or '<tr><td colspan="4">None yet</td></tr>'
+        body = (f'<p>The units this fleet console reaches, each through its own console\'s API.</p>'
+                f'<p><a class="button" href="/units/new">New Unit</a></p><section><table><thead><tr><th>Name</th>'
+                f'<th>URL</th><th>Access</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>')
+        self.reply(200, self.page("Units", body, "/units", flash, bad))
+
+    def unit_new_page(self, method, form):
+        flash = ""
+        if method == "POST":
+            try:
+                unit = unit_from_form(form)
+                self.units.add(dict(unit))
+                return self.flash_back("/units", f"Added {unit['name']}")
+            except ValueError as err:
+                flash = str(err)
+        fields = [("name", "Name", "text", "tv-lobby-01", "Letters, digits, dots, dashes or underscores."),
+                  ("url", "URL", "text", "https://tv-lobby-01.example.com",
+                   "The unit's console: its tunnel's hostname, or http://NAME.local on the same network."),
+                  ("token", "API Token", "password", "tvl_...", "Made on the unit's API Tokens page."),
+                  ("access_id", "Access Client ID", "text", "", "Optional: a Cloudflare Access service token in front "
+                   "of the unit."),
+                  ("access_secret", "Access Client Secret", "password", "", "Optional, with the client ID.")]
+        body = (f'<form method="post" action="/units/new" class="card">{csrf_input(self.sess)}' + "".join(
+            f'<div class="field"><label for="{k}">{label}</label><input type="{t}" id="{k}" name="{k}" '
+            f'placeholder="{p}" autocomplete="off"' + (f' value="{e(form.get(k, ""))}"' if t == "text" else "") +
+            f'{" required" if k in ("name", "url", "token") else ""}><p class="hint">{hint}</p></div>'
+            for k, label, t, p, hint in fields) + '<button>Add Unit</button></form>')
+        self.reply(400 if flash else 200, self.page("New Unit", body, "/units", flash, bool(flash)))
 
     # API
 
@@ -834,7 +1188,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(400, {"error": "Body is a JSON object"})
         route = (method, path)
         if route == ("GET", "/api/status"):
-            return self.json(200, status())
+            return self.json(200, status(brief=query.get("brief") == "1"))
         if route == ("GET", "/api/settings"):
             return self.json(200, schema())
         if route == ("POST", "/api/settings"):
@@ -890,10 +1244,13 @@ class Server(ThreadingHTTPServer):
 def main():
     claim_code()
     try:
-        server = Server(("::", PORT), Handler)
+        server = (Server if ":" in ADDR else ThreadingHTTPServer)((ADDR, PORT), Handler)
     except OSError:  # no IPv6
+        if ADDR != "::":
+            raise
         server = ThreadingHTTPServer(("", PORT), Handler)
-    print(f"Console on port {PORT}, {'claimed' if claimed() else 'claim mode'}", flush=True)
+    mode = "claimed" if claimed() else "claim mode"
+    print(f"{'Fleet console' if FLEET else 'Console'} on {ADDR} port {PORT}, {mode}", flush=True)
     server.serve_forever()
 
 
@@ -974,13 +1331,134 @@ def test():
         assert check_password("long enough pw", read_file(os.path.join(tmp, "password")))
         assert claim_code() == "" and claim(code, "long enough pw", "long enough pw") == "Already claimed"
     assert duration(59) == "0 min" and duration(3700) == "1 h 1 min" and duration(90000) == "1 d 1 h"
+    # Behind a tunnel: the Secure flag from either header; the visitor's IP only from cloudflared on loopback
+    req = lambda peer, **h: types.SimpleNamespace(client_address=(peer, 1),
+                                                  headers={k.replace("_", "-"): v for k, v in h.items()})
+    assert Handler.https(req("::1", Cf_Visitor='{"scheme": "https"}'))
+    assert Handler.https(req("::1", X_Forwarded_Proto="HTTPS"))
+    assert not Handler.https(req("::1")) and not Handler.https(req("::1", Cf_Visitor='{"scheme":"http"}'))
+    assert Handler.client_ip(req("::ffff:127.0.0.1", Cf_Connecting_IP="203.0.113.7")) == "203.0.113.7"
+    assert Handler.client_ip(req("192.0.2.5", Cf_Connecting_IP="203.0.113.7")) == "192.0.2.5"  # not from the LAN
+    assert Handler.client_ip(req("::1", Cf_Connecting_IP="x")) == "::1" and Handler.client_ip(req("::1")) == "::1"
+    test_fleet()
     print("ok")
+
+
+def test_fleet():
+    import tempfile
+    # Units: checked before they are stored, which is fleet user only
+    good = {"name": "tv-lobby-01", "url": "https://tv-lobby-01.example.com/", "token": "tvl_" + "a" * 43}
+    assert unit_from_form(good)["url"] == "https://tv-lobby-01.example.com" and unit_from_form(good)["access_id"] == ""
+    for bad in ({"name": "../x"}, {"name": "a b"}, {"url": "ftp://x.example.com"}, {"url": "https://u:p@x.example"},
+                {"url": "https://x.example/?q"}, {"url": "https://x.example:port"}, {"url": "https://x.example/a b"},
+                {"token": "short"}, {"token": "tvl_" + "a" * 30 + "\r\nX: y"}, {"access_id": "id.access"},
+                {"access_id": "id", "access_secret": "s s"}):
+        try:
+            unit_from_form({**good, **bad})
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        us = Units(os.path.join(tmp, "units.json"))
+        us.add(unit_from_form(good))
+        assert list(us.load()) == ["tv-lobby-01"] and "name" not in us.load()["tv-lobby-01"]
+        assert os.stat(us.path).st_mode & 0o777 == 0o600
+        try:
+            us.add(unit_from_form(good))
+            raise AssertionError("duplicate")
+        except ValueError:
+            pass
+        assert us.remove("tv-lobby-01") and not us.remove("tv-lobby-01") and us.load() == {}
+    # The badge, as the TV's: live, cached (server error), offline (no answer), or the unit is unreachable
+    assert badge(None) == ("bad", "Unreachable") and badge({"state": "ready"}) == ("live", "Live")
+    assert badge({"state": "waiting", "code": "503", "host": "b.example.com"}) == ("warn", "Cached")
+    assert badge({"state": "waiting", "code": "000", "host": "b.example.com"}) == ("bad", "Offline")
+    assert badge({"state": "network", "host": "b.example.com"}) == ("bad", "Offline")
+    assert badge({"state": "folder", "host": ""}) == ("live", "Local Content")
+    assert badge({"state": "setup"}) == ("warn", "Ready to Set Up")
+    assert ago(1000, 1030) == "Just now" and ago(1000, 1000 + 3700) == "1 h 1 min ago"
+
+    # Remote, against stand-in units: the tokens it sends, redirects never followed, every failure says what to check
+    seen = []
+
+    class Unit(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def answer(self, code, body, ctype="application/json", headers=()):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            seen.append((self.path, self.headers))  # names: any case
+            kind, path = self.path.split("/", 2)[1:]
+            if kind == "slow":
+                time.sleep(1)
+            if kind == "access":  # Access without a good service token: off to its login page
+                return self.answer(302, b"", "text/html", [("Location", "https://t.cloudflareaccess.com/login")])
+            if kind == "deny":
+                return self.answer(403, b"<h1>Forbidden</h1>", "text/html")
+            if kind == "revoked":
+                return self.answer(401, {"error": "Log in"})
+            if path == "api/screenshot":
+                return self.answer(200, b"\xff\xd8JPEG", "image/jpeg")
+            self.answer(200, {"name": kind, "state": "ready", "tv": "on", "version": "0.1.0", "screenshot": 1700000000,
+                              "health": []})
+
+        def do_POST(self):
+            seen.append((self.path, self.headers))  # names: any case
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if "OVERLAY_CORNER" in body:
+                return self.answer(400, {"error": "OVERLAY_CORNER is ...", "key": "OVERLAY_CORNER"})
+            self.answer(200, {"ok": True, "message": f"did {body.get('action')}"})
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Unit)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    at = lambda kind, **kw: {"url": f"http://127.0.0.1:{srv.server_port}/{kind}", "token": "tvl_t", **kw}
+    fast = Remote("fast", at("fast", access_id="id.access", access_secret="sec"))
+    s = fast.status()
+    h = seen[-1][1]
+    assert s["tv"] == "on" and s["health"] == [] and SEEN["fast"]["status"]["version"] == "0.1.0"
+    assert h["Authorization"] == "Bearer tvl_t" and h["CF-Access-Client-Id"] == "id.access"
+    assert h["CF-Access-Client-Secret"] == "sec" and "Cookie" not in h
+    Remote("plain", at("plain")).status()
+    assert "CF-Access-Client-Id" not in seen[-1][1]
+    assert fast.screen() == (b"\xff\xd8JPEG", 1700000000)
+    n = len(seen)
+    assert fast.screen()[0] == b"\xff\xd8JPEG" and len(seen) == n  # the same screenshot is fetched once
+    assert fast.action("reload") == (True, "did reload")
+    assert fast.save({"OVERLAY_CORNER": "middle"}) == (False, "OVERLAY_CORNER is ...", "OVERLAY_CORNER")
+    n = len(seen)
+    for kind, says in (("access", "Cloudflare Access service token"), ("deny", "HTTP 403"),
+                       ("revoked", "refused its API token")):
+        try:
+            Remote(kind, at(kind)).status()
+            raise AssertionError(kind)
+        except UnitError as err:
+            assert says in str(err), err
+    assert len(seen) == n + 3  # the redirect was not followed
+    # poll: all at once; a slow or dead unit shows as such without holding up the page, and lands later
+    dead = {"url": "http://127.0.0.1:9/x", "token": "tvl_t"}  # the discard port: refused
+    t0 = time.monotonic()
+    got = poll({"fast": at("fast"), "slow": at("slow"), "dead": dead}, wait=0.4)
+    assert time.monotonic() - t0 < 0.9, time.monotonic() - t0
+    assert got["fast"][0]["tv"] == "on" and got["slow"] == (None, "No answer yet")
+    assert got["dead"][0] is None and "No answer from dead" in got["dead"][1]
+    BUSY["slow"].result(5)
+    assert SEEN["slow"]["status"]["name"] == "slow" and poll({"slow": at("slow")}, wait=2)["slow"][0]
+    srv.shutdown()
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["test"]:
         test()
-    elif len(sys.argv) == 1:
+    elif len(sys.argv) == 1 or sys.argv[1:] == ["--fleet"]:
         main()
     else:
         sys.exit(__doc__)

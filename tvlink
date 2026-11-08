@@ -1,7 +1,7 @@
 #!/bin/bash
 # tvlink: show the splash until the board answers, run it full screen, control the TV over HDMI-CEC.
 # Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|reboot|update|set KEY=value...|console claim|reset
-#        (services and the console use check, kiosk, browser, net, mode, keys --json, logs)
+#        (services and the console use check, kiosk, browser, net, mode, keys --json, logs, tunnel)
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
 VERSION=0.1.0
@@ -9,9 +9,12 @@ CONF=${TVLINK_CONF:-/boot/firmware/tvlink.conf}
 CONTENT=${TVLINK_CONTENT:-/boot/firmware/tvlink}
 # Keys tvlink set may change. UPDATE_DAY is read too; install.sh applies it.
 KEYS="BOARD_URL SOURCE SLIDE_SECONDS FIT POWER_MODE TV_ON TV_OFF IDLE_MIN MOTION_PIN CEC RESOLUTION OVERLAY_CORNER"
-KEYS+=" WIFI_COUNTRY WIFI1_SSID WIFI1_PSK WIFI2_SSID WIFI2_PSK"
+KEYS+=" WIFI_COUNTRY WIFI1_SSID WIFI1_PSK WIFI2_SSID WIFI2_PSK TUNNEL_TOKEN"
 # shellcheck disable=SC2034
-WIFI_COUNTRY='' WIFI1_SSID='' WIFI1_PSK='' WIFI2_SSID='' WIFI2_PSK=''
+WIFI_COUNTRY='' WIFI1_SSID='' WIFI1_PSK='' WIFI2_SSID='' WIFI2_PSK='' TUNNEL_TOKEN=''
+# The tunnel's token lives here, root only, never in the conf on the FAT card: it is a key to the unit's console.
+TUNNEL=${TVLINK_TUNNEL:-/etc/tvlink/tunnel-token}
+TUNNEL_READY=http://127.0.0.1:20241/ready # cloudflared's metrics: 200 once it holds a connection to Cloudflare
 # shellcheck disable=SC2034 # defaults; some are only read through ${!k} in show
 BOARD_URL='' SOURCE=auto SLIDE_SECONDS=10 FIT=contain POWER_MODE=schedule TV_ON=06:00 TV_OFF=22:00 IDLE_MIN=15
 # shellcheck disable=SC2034
@@ -37,6 +40,7 @@ WIFI1_SSID|text|Network 1|Wi-Fi network name. Hidden networks work.
 WIFI1_PSK|secret|Password 1|Blank: an open network.
 WIFI2_SSID|text|Network 2|A second network, eg the next one when the site changes its Wi-Fi.
 WIFI2_PSK|secret|Password 2|Blank: an open network.
+TUNNEL_TOKEN|secret|Tunnel Token|Cloudflare Tunnel token for this unit. Kept on the unit, not the SD card. Clear: off.
 '
 
 die() { echo "$*" >&2; exit 1; }
@@ -55,7 +59,7 @@ read_conf() {
     [[ $line == *=* ]] || continue
     k=${line%%=*} v=${line#*=}
     k=${k//[[:space:]]/}
-    [[ " $KEYS UPDATE_DAY " == *" $k "* ]] || continue
+    [[ " $KEYS UPDATE_DAY " == *" $k "* && $k != TUNNEL_TOKEN ]] || continue
     v=${v#"${v%%[![:space:]]*}"}
     q=${v:0:1}
     if [[ ($q == \" || $q == \') && ${v:1} == *"$q"* ]]; then
@@ -68,6 +72,8 @@ read_conf() {
   done <"$CONF"
 }
 [ -r "$CONF" ] && read_conf
+# shellcheck disable=SC2034 # read through ${!k}; whether it is set: anyone may know that, only root reads it
+[ ! -s "$TUNNEL" ] || TUNNEL_TOKEN='(set)'
 # A bad hand edit falls back to the default instead of breaking the screen; tvlink set refuses the same values.
 [[ -z $BOARD_URL || $BOARD_URL =~ ^https?://[^[:space:]]+$ ]] ||
   { echo "BOARD_URL ignored: not an http(s) link" >&2; BOARD_URL=''; }
@@ -303,9 +309,47 @@ doctor() {
   done
   echo "Wi-Fi: $(nmcli -t -f NAME connection show --active 2>/dev/null | paste -sd' ' -)," \
     "$(iw dev wlan0 get power_save 2>/dev/null)"
+  echo "Tunnel: $(tunnel_state)"
   echo "Watchdog: $(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)," \
     "root $(grep -q ' / overlay ' /proc/mounts 2>/dev/null && echo read-only || echo writable)"
   echo "Versions: $(dpkg-query -W -f '${Package} ${Version}, ' cage chromium wlr-randr v4l-utils 2>/dev/null)"
+}
+
+# off, connected or not connected. No root needed: whether the token file exists, and cloudflared's ready check.
+tunnel_state() {
+  if [ ! -s "$TUNNEL" ]; then echo off
+  elif curl -fs -m 3 -o /dev/null "$TUNNEL_READY"; then echo connected
+  else echo "not connected"
+  fi
+}
+
+# cloudflared from Cloudflare's own apt repo, signed by its key. Only when a token is first set: a unit without a
+# tunnel never gets the repo or the package. Updates then come with the security updates (install.sh).
+cloudflared_install() {
+  local key=/usr/share/keyrings/cloudflare-main.gpg
+  command -v cloudflared >/dev/null && return
+  echo "Installing cloudflared from pkg.cloudflare.com"
+  curl -fsSL -m 60 -o "$key.tmp" https://pkg.cloudflare.com/cloudflare-main.gpg && mv -f "$key.tmp" "$key" &&
+    echo "deb [signed-by=$key] https://pkg.cloudflare.com/cloudflared any main" \
+      >/etc/apt/sources.list.d/cloudflared.list &&
+    apt-get -q -o DPkg::Lock::Timeout=120 update >/dev/null &&
+    DEBIAN_FRONTEND=noninteractive apt-get -q -y -o DPkg::Lock::Timeout=120 install cloudflared >/dev/null
+}
+
+# Set the tunnel's token (written root only, beside then renamed) and (re)start the tunnel; blank: stop it for good.
+tunnel_set() {
+  if [ -z "$1" ]; then
+    systemctl disable --now tvlink-tunnel 2>/dev/null
+    rm -f "$TUNNEL"
+    return
+  fi
+  cloudflared_install || die "Can't install cloudflared: token not saved"
+  if ! install -d -m 755 "${TUNNEL%/*}" || ! (umask 077 && printf '%s\n' "$1" >"$TUNNEL.tmp") ||
+    ! mv -f "$TUNNEL.tmp" "$TUNNEL"; then
+    die "Can't write $TUNNEL"
+  fi
+  systemctl enable --quiet tvlink-tunnel || die "Can't enable tvlink-tunnel"
+  systemctl restart tvlink-tunnel || die "Can't start tvlink-tunnel"
 }
 
 # Hand a one-word request (identify, screenshot, reload) to tvlink-agent, which picks it up within a second. Written
@@ -390,7 +434,7 @@ console() {
 set_conf() {
   [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink set KEY=value"
   [ $# -gt 0 ] || die "Usage: tvlink set KEY=value... (keys: $KEYS)"
-  local kv key value kiosk=0 net=0 power=0
+  local kv key value kiosk=0 net=0 power=0 tunnel=- # - : not given (a token is never -)
   for kv in "$@"; do # check every value before writing any
     key=${kv%%=*} value=${kv#*=}
     [[ $kv == *=* && $key =~ ^[A-Z0-9_]+$ && " $KEYS " == *" $key "* ]] || die "Unknown setting: $kv (keys: $KEYS)"
@@ -414,11 +458,16 @@ set_conf() {
       WIFI?_SSID) (LC_ALL=C && [ ${#value} -le 32 ]) || die "$key is at most 32 bytes" ;;
       WIFI?_PSK) [[ -z $value || ${#value} -ge 8 && ${#value} -le 63 ]] ||
         die "$key is 8 to 63 characters, or blank for an open network" ;;
+      # base64 of JSON with the account (a), tunnel (t) and secret (s)
+      TUNNEL_TOKEN) [[ -z $value || ($value =~ ^[A-Za-z0-9+/=_-]{40,4096}$ &&
+        $(base64 -d <<<"$value" 2>/dev/null) == *'"t":'*) ]] ||
+        die "TUNNEL_TOKEN is the tunnel's token from Cloudflare (eyJ...), or blank to turn the tunnel off" ;;
     esac
   done
   touch "$CONF" || die "Can't write $CONF"
   for kv in "$@"; do
     key=${kv%%=*} value=${kv#*=}
+    if [ "$key" = TUNNEL_TOKEN ]; then tunnel=$value && continue; fi # not in the conf: below
     # Write beside it, flush, rename, flush: a power cut leaves the old or the new conf (FAT has no journal, so
     # in practice, not in theory). Values pass through ENVIRON, so backslashes stay literal.
     # Keys match as read_conf reads them (spaces ignored), and every line for the key becomes one.
@@ -438,6 +487,7 @@ set_conf() {
   [ "$power" = 0 ] || systemctl restart tvlink-power
   [ "$kiosk" = 0 ] || systemctl restart tvlink
   [ "$net" = 0 ] || systemctl restart tvlink-net
+  [ "$tunnel" = - ] || { tunnel_set "$tunnel" && echo "TUNNEL_TOKEN=${tunnel:+(set)}"; }
 }
 
 case $1 in
@@ -463,6 +513,7 @@ case $1 in
   keys) keys "${2:-}" ;;
   logs) logs "${2:-}" ;;
   console) console "${2:-}" ;;
+  tunnel) tunnel_state ;;
   reboot) # planned, so POWER_MODE=manual does not wake the TV after it; in 3 s, so the console can answer first
     [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink reboot"
     touch /boot/firmware/.tvlink-planned-reboot

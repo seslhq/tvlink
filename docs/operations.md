@@ -2,9 +2,10 @@
 
 ## Remote management
 
-Use the unit's console first ([console](console.md)): `http://<name>.local` on the site network, or through a tunnel
-from elsewhere. It shows the screen and the unit's health, changes settings and Wi-Fi, runs the actions below, shows
-the logs and installs updates.
+Use the unit's console first ([console](console.md)): `http://<name>.local` on the site network, or from elsewhere
+through its tunnel (`TUNNEL_TOKEN`, [Cloudflare](cloudflare.md)). It shows the screen and the unit's health, changes
+settings and Wi-Fi, runs the actions below, shows the logs and installs updates. A [fleet console](fleet.md) shows all
+units on one page and opens each one's pages.
 
 Keep a shell as break-glass, for when the console can't be reached or its password is lost
 (`sudo tvlink console reset`). Raspberry Pi Connect is the recommended one: it is preinstalled on Raspberry Pi OS Lite,
@@ -22,6 +23,7 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 | `sudo tvlink update URL SHA256` | Installs a commit of `main` (below) |
 | `sudo tvlink reboot` | Reboots in 3 s, as a planned reboot (`manual` mode does not wake the TV after it) |
 | `sudo tvlink console claim`, `sudo tvlink console reset` | The console's claim code; back to claim mode after a lost password |
+| `tvlink tunnel` | The tunnel: `off`, `connected` or `not connected` |
 
 - Screenshot off the unit: the console's Status page. Without it: `scp` if SSH is on. In a Connect shell, run
   `base64 /run/tvlink/screen.jpg`, copy all of its output, then on your computer run `base64 -d >screen.jpg`, paste
@@ -34,7 +36,8 @@ Connect for Organisations past a handful of units. Any other remote shell works 
   then needs someone on site to cycle its power.
 - SSH: public-key only. Once Connect works it can be turned off: `sudo systemctl disable --now ssh`.
 - Network needs: inbound HTTP (80) from the site network for the console, outbound HTTPS (443), HTTP (80) to
-  deb.debian.org and archive.raspberrypi.com for updates, and NTP (UDP 123); no captive portal; WPA2 Personal or WPA3
+  deb.debian.org and archive.raspberrypi.com for updates, and NTP (UDP 123); with a tunnel, outbound 7844 (UDP, or
+  TCP) to Cloudflare; no captive portal; WPA2 Personal or WPA3
   in transition mode. Where public NTP is blocked, put `[Time]` and `NTP=<server>` in
   `/etc/systemd/timesyncd.conf.d/tvlink.conf` (`sudo mkdir -p` the folder first), run
   `sudo systemctl restart systemd-timesyncd`, and check that `timedatectl` says the clock is synchronized.
@@ -73,6 +76,7 @@ halfway: `journalctl -u tvlink-update -f`.
 - The console's Logs page shows the kiosk, TV power and Wi-Fi logs below; its Status page shows `tvlink doctor`.
   `journalctl -u tvlink-console -b` has its own log, if the console itself is down: `systemctl status tvlink-console`.
 - Badge changes and page recoveries are in the same log: `journalctl -t tvlink -b | grep 'Badge\|Recover'`.
+- `Tunnel: not connected` in `tvlink doctor`: `journalctl -u tvlink-tunnel -b` ([Cloudflare](cloudflare.md)).
 - `journalctl -u tvlink-power -b`: power mode, clock, wakes and standbys, `TV reports ...`, motion sensor problems.
 - `tvlink status` says `unknown`: CEC is off in the TV menu, or the TV does not answer power queries.
 - A server page such as 404 on the TV: the page answered, so tvlink shows its answer, with `Board not found` on the
@@ -97,7 +101,8 @@ halfway: `journalctl -u tvlink-update -f`.
 
 - Dead Pi: move its card to a spare Pi (same name and settings). Connect is tied to the Pi's serial number and signs
   out, so run `rpi-connect signin` on site.
-- Dead card: image a new one and provision it with the same hostname and page link.
+- Dead card: image a new one and provision it with the same hostname and page link; set `TUNNEL_TOKEN` again (it
+  lives on the card's root partition, not in tvlink.conf).
 
 ## Read-only root (optional)
 

@@ -1,0 +1,29 @@
+# tvlink tunnel: a Cloudflare Tunnel to the unit console (http://localhost:80). Enabled by tvlink set TUNNEL_TOKEN=...,
+# disabled when it is cleared. The token never reaches the command line, which ps shows: systemd hands the root-only
+# file to cloudflared, which runs as a throwaway user, as a credential only it can read.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink tunnel: Cloudflare Tunnel to the unit console
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/tvlink/tunnel-token
+
+[Service]
+DynamicUser=yes
+LoadCredential=token:/etc/tvlink/tunnel-token
+# Updates come from apt (install.sh adds the repo to unattended-upgrades); metrics, for tvlink tunnel, on loopback.
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --metrics 127.0.0.1:20241 run --token-file %d/token
+Restart=always
+RestartSec=10
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
