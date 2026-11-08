@@ -1,0 +1,31 @@
+[Unit]
+Description=tvlink unit console: web pages and JSON API on port 80
+After=network.target
+
+[Service]
+User=tvlink-console
+ExecStart=/usr/local/bin/tvlink-console
+# Port 80 without root. Root only through sudo, for the tvlink commands in /etc/sudoers.d/tvlink-console: so no
+# NoNewPrivileges, nor the settings that imply it (eg PrivateDevices, SystemCallFilter, RestrictSUIDSGID).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Password and API tokens; the claim code, which the splash shows.
+StateDirectory=tvlink-console
+StateDirectoryMode=0700
+RuntimeDirectory=tvlink-console
+RuntimeDirectoryMode=0755
+UMask=0077
+# The console sees the system read-only. tvlink's commands run outside this sandbox (tvlink reruns itself with
+# systemd-run when sudo starts it from here), so they work as from a root shell.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProtectHostname=yes
+PrivateIPC=yes
+RemoveIPC=yes
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

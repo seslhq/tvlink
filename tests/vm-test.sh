@@ -26,7 +26,8 @@ echo "== Install and self-tests"
 ./install.sh >/var/log/tvlink-test-install.log 2>&1 || { tail -20 /var/log/tvlink-test-install.log; exit 1; }
 check "tvlink-power test" quiet python3 tvlink-power test
 check "tvlink-agent test" quiet python3 tvlink-agent test
-for u in tvlink tvlink-power tvlink-net; do check "$u running" systemctl -q is-active "$u"; done
+check "tvlink-console test" quiet python3 tvlink-console test
+for u in tvlink tvlink-power tvlink-net tvlink-console; do check "$u running" systemctl -q is-active "$u"; done
 
 echo "== TV over HDMI-CEC"
 # vivid's HDMI input is the TV and its HDMI output the Pi, cabled together; cec-follower answers as the TV. The TV
@@ -126,6 +127,64 @@ check "kiosk can't plant a user unit in its home" quiet test "$(runuser -u kiosk
   mkdir -p /home/kiosk/.config/systemd/user >/dev/null 2>&1; echo $?)" != 0
 check "the session wrote nothing to the kiosk's home" test -z "$(ls -A /home/kiosk)"
 check "/run/tvlink stays under 40 MB" test "$(du -sm /run/tvlink | cut -f1)" -lt 40
+
+echo "== Unit console"
+c=/run/tvlink-test-console
+mkdir -p "$c" && rm -f "$c"/*
+web() { # [curl options...] path: the HTTP code; body in $c/body, cookies in $c/jar
+  curl -s -o "$c/body" -w '%{http_code}' -b "$c/jar" -c "$c/jar" "${@:1:$#-1}" "http://127.0.0.1${!#}"
+}
+csrf() { sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$c/body" | head -n 1; }
+field() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$c/body" "$1"; }
+splash_claim() { grep -q "\"claim\":\"$1\"" /run/tvlink/status.js; }
+tvlink console reset >/dev/null # back to claim mode, as on a new unit
+code=$(tvlink console claim | sed -n 's/.*Code: //p')
+check "claim code from tvlink console claim" grep -qE '^[A-Z0-9]{3}-[A-Z0-9]{3}$' <<<"$code"
+check "claim code on the splash" within 70 splash_claim "$code"
+check "claim mode: pages lead to the claim page" test "$(web /settings)" = 303
+web /claim >/dev/null
+check "claim refuses a wrong code" test "$(web -d "csrf=$(csrf)" -d code=ZZZ-ZZ -d password=vm-test-password \
+  -d repeat=vm-test-password /claim)" = 400
+check "claiming sets a password" test "$(web -d "csrf=$(csrf)" -d "code=$code" -d password=vm-test-password \
+  -d repeat=vm-test-password /claim)" = 303
+check "password stored as a PBKDF2 hash" grep -q '^pbkdf2_sha256[$]600000[$]' /var/lib/tvlink-console/password
+check "claimed: no claim code to print" quiet test "$(tvlink console claim >/dev/null 2>&1; echo $?)" = 1
+rm -f "$c/jar"
+web /login >/dev/null
+check "login refuses a wrong password" test "$(web -d "csrf=$(csrf)" -d password=wrong-password /login)" = 401
+check "login works" test "$(web -d "csrf=$(csrf)" -d password=vm-test-password /login)" = 303
+check "logged in: Status page" test "$(web /)" = 200
+t=$(csrf)
+check "a form without its CSRF token is refused" test "$(web -d action=identify /actions)" = 403
+check "API with a session but no CSRF header is refused" test "$(web -d '{"action":"identify"}' /api/action)" = 403
+check "API with neither session nor token is refused" \
+  test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/api/status)" = 401
+check "the console user can't run other commands as root" \
+  quiet test "$(runuser -u tvlink-console -- sudo -n /usr/local/bin/tvlink show >/dev/null 2>&1; echo $?)" != 0
+web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-test >/dev/null # left by an earlier run
+web -H "X-CSRF-Token: $t" -d '{"name": "vm-test"}' /api/tokens >/dev/null
+token=$(field token)
+bearer() { curl -s -o "$c/body" -w '%{http_code}' -H "Authorization: Bearer $token" "$@"; }
+check "API token stored hashed only" quiet test -n "$token" -a \
+  "$(grep -c "$token" /var/lib/tvlink-console/tokens.json)" = 0
+since=$(date '+%F %T')
+check "API token: reload" test "$(bearer -d '{"action": "reload"}' http://127.0.0.1/api/action)" = 200
+check "... the page reloads" within 10 logged 'Request: reload'
+check "API token: last screenshot" test "$(bearer http://127.0.0.1/api/screenshot)" = 200
+check "API token revoked" test "$(web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-test)" = 200
+check "... and refused after" test "$(bearer http://127.0.0.1/api/status)" = 401
+since=$(date '+%F %T')
+check "API sets OVERLAY_CORNER" test "$(web -H "X-CSRF-Token: $t" -d '{"OVERLAY_CORNER": "top-left"}' \
+  /api/settings)" = 200
+check "... tvlink reads it" grep -qx OVERLAY_CORNER=top-left <(tvlink show)
+web /api/settings >/dev/null
+check "... the API reads it back" grep -qx top-left <(python3 -c 'import json, sys
+print(next(k["value"] for k in json.load(open(sys.argv[1]))["keys"] if k["key"] == "OVERLAY_CORNER"))' "$c/body")
+check "... and sudo did not log the command" quiet test "$(journalctl -q --since "$since" | grep -c OVERLAY_CORNER)" = 0
+check "API refuses a bad value, naming the key" test "$(web -H "X-CSRF-Token: $t" -d '{"OVERLAY_CORNER": "middle"}' \
+  /api/settings)/$(field key)" = 400/OVERLAY_CORNER
+check "claimed: the code is gone from the splash" within 60 splash_claim ''
+tvlink set OVERLAY_CORNER=bottom-right >/dev/null
 
 echo "== $fails failed"
 [ "$fails" = 0 ]

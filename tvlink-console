@@ -1,0 +1,986 @@
+#!/usr/bin/python3 -s
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+"""The unit console: web pages and a JSON API for one tvlink unit. Usage: tvlink-console | tvlink-console test
+
+Runs as the tvlink-console user (tvlink-console.service) on port 80. Until a password is set it is in claim mode: only
+the claim page, which needs the one-time code on the TV's splash (also `sudo tvlink console claim`). Root only through
+sudo, for the tvlink commands in /etc/sudoers.d/tvlink-console; nothing from a request reaches a shell.
+Pages: a session cookie, and a CSRF token on every change. API (/api/*): an API token (Authorization: Bearer), or a
+session plus the X-CSRF-Token header on changes. Sessions live in memory: a restart logs everyone out.
+"""
+import base64
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlsplit
+
+CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
+SUDO = os.environ.get("TVLINK_SUDO", "/usr/bin/sudo")
+STATE = os.environ.get("TVLINK_CONSOLE_STATE", "/var/lib/tvlink-console")  # password and tokens, console user only
+RUN = os.environ.get("TVLINK_CONSOLE_RUN", "/run/tvlink-console")  # the claim code, read by the splash
+STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
+PORT = int(os.environ.get("TVLINK_CONSOLE_PORT", "80"))
+SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
+ITERATIONS = 600_000  # PBKDF2-SHA256, OWASP's 2023 figure
+MIN_PASSWORD = 10
+SESSION_TTL, ANON_TTL, MAX_ANON = 12 * 3600, 3600, 500  # anonymous sessions only carry the login and claim forms
+TRIES, WINDOW = 5, 300  # failed logins or claims per client per 5 min; four times that from everyone
+ACTIONS = ("reload", "identify", "screenshot", "on", "off", "reboot")
+LOGS = ("kiosk", "power", "net")
+CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I, O, 0 or 1
+STATES = {"ready": "Live", "folder": "Local Content", "setup": "Ready to Set Up", "network": "No Network",
+          "waiting": "Can't Reach the Board", "empty": "No Files to Show", "starting": "Starting"}
+
+
+# Passwords, tokens and claim codes
+
+def hash_password(password, iterations=ITERATIONS):
+    salt = secrets.token_bytes(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${base64.b64encode(salt).decode()}${base64.b64encode(key).decode()}"
+
+
+def check_password(password, stored):
+    try:
+        algo, n, salt, key = stored.strip().split("$")
+        got = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(n))
+        return algo == "pbkdf2_sha256" and hmac.compare_digest(got, base64.b64decode(key))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def new_code():
+    c = "".join(secrets.choice(CODE_CHARS) for _ in range(6))
+    return f"{c[:3]}-{c[3:]}"  # eg K7M-4QX
+
+
+def code_matches(given, code):
+    norm = lambda s: re.sub(r"[^A-Z0-9]", "", s.upper())
+    return bool(code) and hmac.compare_digest(norm(given), norm(code))
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()  # tokens are random 256-bit: no need for a slow hash
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write_file(path, text, mode=0o600):
+    """Beside, flushed, then renamed: a power cut leaves the old file or the new one."""
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)  # whatever the umask
+    os.replace(tmp, path)
+
+
+class Tokens:
+    """API tokens by name, stored as SHA-256 only. The token itself is shown once, when made."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+
+    def load(self):
+        try:
+            return json.loads(read_file(self.path) or "{}")
+        except ValueError:
+            return {}
+
+    def list(self):
+        return [{"name": n, "created": t.get("created", "")} for n, t in sorted(self.load().items())]
+
+    def create(self, name):
+        name = (name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", name):
+            raise ValueError("Name is 1 to 40 letters, digits, spaces, dots, dashes or underscores")
+        with self.lock:
+            tokens = self.load()
+            if name in tokens:
+                raise ValueError(f"A token named {name} already exists")
+            token = "tvl_" + secrets.token_urlsafe(32)
+            tokens[name] = {"sha256": token_hash(token), "created": time.strftime("%Y-%m-%d %H:%M")}
+            write_file(self.path, json.dumps(tokens, indent=1))
+        return token
+
+    def revoke(self, name):
+        with self.lock:
+            tokens = self.load()
+            if tokens.pop(name, None) is None:
+                return False
+            write_file(self.path, json.dumps(tokens, indent=1))
+            return True
+
+    def check(self, token):
+        """The token's name, or None."""
+        if not token:
+            return None
+        h = token_hash(token)
+        found = None
+        for name, t in self.load().items():  # compare with every one, in constant time
+            if hmac.compare_digest(h, t.get("sha256", "")):
+                found = name
+        return found
+
+
+class Sessions:
+    """In memory. Anonymous ones (auth False) carry the CSRF token of the login and claim forms."""
+
+    def __init__(self):
+        self.data, self.lock = {}, threading.Lock()
+
+    def new(self, auth=False):
+        sid, now = secrets.token_urlsafe(32), time.time()
+        with self.lock:
+            self.data = {k: v for k, v in self.data.items() if v["expires"] > now}
+            anon = sorted((v["expires"], k) for k, v in self.data.items() if not v["auth"])
+            for _, k in anon[:max(0, len(anon) - MAX_ANON + 1)]:  # a flood of form loads can't fill memory
+                del self.data[k]
+            self.data[sid] = {"auth": auth, "csrf": secrets.token_urlsafe(32), "flash": "",
+                              "expires": now + (SESSION_TTL if auth else ANON_TTL)}
+        return sid
+
+    def get(self, sid):
+        with self.lock:
+            s = self.data.get(sid or "")
+            return s if s and s["expires"] > time.time() else None
+
+    def drop(self, sid):
+        with self.lock:
+            self.data.pop(sid or "", None)
+
+
+class Limiter:
+    """Failed tries per client in a sliding window, plus a cap across all clients."""
+
+    def __init__(self, tries=TRIES, window=WINDOW):
+        self.tries, self.window, self.fails, self.lock = tries, window, {}, threading.Lock()
+
+    def _recent(self, key, now):
+        self.fails[key] = [t for t in self.fails.get(key, []) if now - t < self.window]
+        return self.fails[key]
+
+    def blocked(self, ip, now=None):
+        now = now or time.monotonic()
+        with self.lock:
+            return len(self._recent(ip, now)) >= self.tries or len(self._recent("*", now)) >= 4 * self.tries
+
+    def fail(self, ip, now=None):
+        now = now or time.monotonic()
+        with self.lock:
+            self._recent(ip, now).append(now)
+            self._recent("*", now).append(now)
+
+
+# The unit, through tvlink
+
+def tvlink(*args, root=True, timeout=90):
+    """(ok, stdout, stderr). A list of arguments, never a shell; root through sudo's fixed list."""
+    cmd = ([SUDO, "-n", CLI] if root else [CLI]) + list(args)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode == 0, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, "", str(e)
+
+
+def schema():
+    """{"version", "keys": [...]} from `tvlink keys --json`."""
+    ok, out, err = tvlink("keys", "--json", root=False)
+    try:
+        return json.loads(out)
+    except ValueError:
+        return {"version": "", "keys": [], "error": err or "Can't read the settings"}
+
+
+def save(changes):
+    """Set {KEY: value} with one `tvlink set`: (ok, message, key the message is about)."""
+    if not changes:
+        return True, "Nothing changed", None
+    for k, v in changes.items():
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", k) or not isinstance(v, str):
+            return False, f"Unknown setting: {k}", None
+    ok, out, err = tvlink("set", *(f"{k}={v}" for k, v in changes.items()), timeout=120)
+    if ok:
+        return True, "Saved", None
+    msg = err or out or "Can't save"
+    return False, msg, error_key(msg, changes)
+
+
+def error_key(msg, keys):
+    return next((k for k in keys if re.search(rf"(?<![A-Z0-9_]){k}(?![A-Z0-9_])", msg)), None)
+
+
+def read_status(path=STATUS):
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read().strip()
+        return json.loads(text[text.index("(") + 1:text.rindex(")")])
+    except (OSError, ValueError):
+        return {}
+
+
+def screen():
+    """(JPEG bytes, mtime) of the last screenshot, or (None, None). Never through a link: the folder is the kiosk's."""
+    try:
+        fd = os.open(SCREEN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None, None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return None, None
+        return f.read(16 * 2**20), st.st_mtime
+
+
+def uptime():
+    try:
+        with open("/proc/uptime") as f:
+            secs = int(float(f.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return 0
+    return secs
+
+
+def duration(secs):
+    d, h, m = secs // 86400, secs // 3600 % 24, secs // 60 % 60
+    return f"{d} d {h} h" if d else f"{h} h {m} min" if h else f"{m} min"
+
+
+def status():
+    s = read_status()
+    _, tv, _ = tvlink("status", timeout=30)
+    _, doctor, err = tvlink("doctor", timeout=60)
+    _, shot = screen()
+    label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
+    if s.get("code") and s.get("code") != "000" and s.get("state") in ("waiting", "folder"):
+        label += f" (HTTP {s['code']})"
+    return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": schema().get("version"),
+            "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
+            "tv": tv or "unknown", "uptime": uptime(), "health": (doctor or err).splitlines(),
+            "screenshot": int(shot) if shot else None}
+
+
+def networks():
+    """Visible Wi-Fi networks, strongest first: [{ssid, signal, security}]. From the last scan: no root needed."""
+    try:
+        out = subprocess.run(["nmcli", "-g", "SIGNAL,SECURITY,SSID", "device", "wifi", "list", "--rescan", "no"],
+                             capture_output=True, text=True, errors="replace", timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    best = {}
+    for line in out.splitlines():
+        try:
+            signal, security, ssid = line.split(":", 2)  # SSID last: only it can hold an (escaped) colon
+            ssid = re.sub(r"\\(.)", r"\1", ssid)
+            if ssid and int(signal) > best.get(ssid, {}).get("signal", -1):
+                best[ssid] = {"ssid": ssid, "signal": int(signal), "security": security or "Open"}
+        except ValueError:
+            pass
+    return sorted(best.values(), key=lambda n: -n["signal"])
+
+
+def logs(which=LOGS):
+    return {w: (lambda r: r[1] or r[2])(tvlink("logs", w)) for w in which}
+
+
+def claimed():
+    return os.path.exists(os.path.join(STATE, "password"))
+
+
+CLAIM_LOCK = threading.Lock()
+
+
+def claim_code():
+    """The current claim code, made when needed (at start, or after a reset without a restart)."""
+    with CLAIM_LOCK:
+        path = os.path.join(RUN, "claim")
+        code = (read_file(path) or "").strip()
+        if not code and not claimed():
+            code = new_code()
+            write_file(path, code + "\n", 0o644)  # the splash (kiosk user) shows it
+        return code
+
+
+def claim(code, password, repeat):
+    """Set the first password with the claim code: an error, or None."""
+    with CLAIM_LOCK:
+        if claimed():
+            return "Already claimed"
+        if not code_matches(code, (read_file(os.path.join(RUN, "claim")) or "").strip()):
+            return "Wrong claim code"
+        if len(password) < MIN_PASSWORD:
+            return f"Use at least {MIN_PASSWORD} characters"
+        if password != repeat:
+            return "The passwords don't match"
+        write_file(os.path.join(STATE, "password"), hash_password(password) + "\n")
+        try:
+            os.remove(os.path.join(RUN, "claim"))
+        except OSError:
+            pass
+    return None
+
+
+# Pages
+
+e = html.escape
+MARK = ('<svg viewBox="0 0 174 110" aria-hidden="true"><rect x="7" y="10" width="160" height="90" rx="16" fill="none" '
+        'stroke="currentColor" stroke-width="14"/><circle cx="141" cy="74" r="12" fill="#2FD07A"/></svg>')
+NAV = (("/", "Status"), ("/settings", "Settings"), ("/actions", "Actions"), ("/logs", "Logs"), ("/wifi", "Wi-Fi"),
+       ("/update", "Update"), ("/tokens", "API Tokens"))
+CSS = """:root { --ink: #0E1116; --paper: #F4F6F8; --muted: #9AA4B2; --live: #2FD07A; --warn: #F5A524; --bad: #F04438;
+  --panel: #171B22; --line: #2A303A; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ink); color: var(--paper); font: 16px/1.5 system-ui, "DejaVu Sans", sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.5rem; padding: .75rem 1.25rem;
+  border-bottom: 1px solid var(--line); }
+header .unit { display: flex; align-items: center; gap: .6rem; font-weight: 600; }
+header svg { width: 2rem; height: auto; }
+nav { display: flex; flex-wrap: wrap; gap: .25rem; flex: 1; }
+nav a { color: var(--muted); text-decoration: none; padding: .3rem .6rem; border-radius: .4rem; }
+nav a:hover, nav a[aria-current] { color: var(--paper); background: var(--panel); }
+nav form { margin-left: auto; }
+main { max-width: 60rem; margin: 0 auto; padding: 1.25rem; }
+h1 { font-size: 1.5rem; margin: 0 0 1rem; } h2 { font-size: 1.1rem; margin: 2rem 0 .75rem; }
+p, .hint { color: var(--muted); } .hint { font-size: .85rem; margin: .25rem 0 0; }
+a { color: var(--paper); }
+section, .card { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: 1rem; }
+.grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); align-items: start; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: .4rem 1rem; margin: 0; }
+dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+figure { margin: 0; } figure img { width: 100%; display: block; border-radius: .4rem; background: #000; }
+figcaption { display: flex; justify-content: space-between; align-items: center; gap: .5rem; margin-top: .5rem;
+  color: var(--muted); font-size: .85rem; }
+.noshot { aspect-ratio: 16 / 9; display: grid; place-items: center; background: #000; border-radius: .4rem;
+  color: var(--muted); }
+pre { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: .75rem; margin: 0;
+  overflow-x: auto; font-size: .8rem; line-height: 1.45; max-height: 28rem; }
+label { display: block; font-weight: 600; margin-bottom: .25rem; }
+.field { margin-bottom: 1rem; }
+input, select { width: 100%; font: inherit; color: var(--paper); background: var(--ink); border: 1px solid var(--line);
+  border-radius: .4rem; padding: .5rem .6rem; }
+input:focus, select:focus, button:focus-visible, summary:focus-visible { outline: 2px solid var(--paper);
+  outline-offset: 1px; }
+.check { display: inline-flex; align-items: center; gap: .4rem; font-weight: 400; color: var(--muted);
+  margin-top: .35rem; } .check input { width: auto; }
+[aria-invalid] { border-color: var(--bad); } .error { color: var(--bad); font-size: .85rem; margin: .25rem 0 0; }
+button, summary.button { font: inherit; font-weight: 600; color: var(--ink); background: var(--paper); border: 0;
+  border-radius: .4rem; padding: .5rem 1rem; cursor: pointer; display: inline-block; }
+button.quiet { color: var(--paper); background: transparent; border: 1px solid var(--line); }
+button.danger, summary.danger { background: var(--bad); color: var(--ink); }
+summary { list-style: none; } summary::-webkit-details-marker { display: none; }
+summary .open, details[open] summary .closed { display: none; } details[open] summary .open { display: inline; }
+details[open] summary { color: var(--paper); background: transparent; border: 1px solid var(--line); }
+details form { margin-top: .5rem; }
+.actions { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); }
+.actions .card { display: flex; flex-direction: column; align-items: flex-start; }
+.actions .card p { margin: .25rem 0 .75rem; font-size: .9rem; flex: 1; }
+.row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+.flash { padding: .6rem .9rem; border-radius: .4rem; margin-bottom: 1rem; background: var(--panel);
+  border-left: 4px solid var(--paper); white-space: pre-wrap; }
+.flash.bad { border-color: var(--bad); }
+.pill { display: inline-flex; align-items: center; gap: .4rem; font-weight: 600; }
+.pill::before { content: ""; width: .6rem; height: .6rem; border-radius: 50%; background: var(--warn); }
+.pill.live::before { background: var(--live); } .pill.bad::before { background: var(--bad); }
+table { width: 100%; border-collapse: collapse; } th, td { text-align: left; padding: .45rem .5rem;
+  border-bottom: 1px solid var(--line); } th { color: var(--muted); font-weight: 400; }
+main:has(> .narrow) { max-width: 26rem; margin-top: 2rem; }
+.secret { font-family: ui-monospace, monospace; }
+@media (max-width: 40rem) { header { padding: .75rem; } nav { flex-basis: 100%; } main { padding: 1rem .75rem; } }
+"""
+
+
+def csrf_input(sess):
+    return f'<input type="hidden" name="csrf" value="{e(sess["csrf"])}">'
+
+
+def page(title, body, sess=None, path="", flash="", bad=False):
+    name = e(socket.gethostname())
+    nav = ""
+    if sess and sess["auth"]:
+        links = "".join(f'<a href="{href}"{" aria-current=page" if href == path else ""}>{label}</a>'
+                        for href, label in NAV)
+        nav = (f'<nav>{links}<form method="post" action="/logout">{csrf_input(sess)}'
+               '<button class="quiet">Log Out</button></form></nav>')
+    flash = f'<div class="flash{" bad" if bad else ""}" role="status">{e(flash)}</div>' if flash else ""
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>{e(title)} · {name}</title><link rel="stylesheet" href="/console.css"></head><body>'
+            f'<header><span class="unit">{MARK}{name}</span>{nav}</header>'
+            f'<main><h1>{e(title)}</h1>{flash}{body}</main></body></html>')
+
+
+def field(k, value=None, error=""):
+    """One settings input from the schema; value: what was just posted, to show it again with its error."""
+    key, kind = k["key"], k["type"]
+    value = k.get("value", "") if value is None else value
+    attrs = f'name="{e(key)}" id="{e(key)}"' + (f' aria-invalid="true" aria-describedby="{e(key)}-error"'
+                                                  if error else "")
+    if kind == "choice":
+        options = list(k.get("choices", []))
+        if value not in options:
+            options.insert(0, value)
+        opts = "".join(f'<option{" selected" if c == value else ""}>{e(c)}</option>' for c in options)
+        inp = f"<select {attrs}>{opts}</select>"
+    elif kind == "secret":  # write-only: never sent to the browser
+        inp = (f'<input type="password" {attrs} autocomplete="new-password" '
+               f'placeholder="{"(set)" if k.get("set") else "(not set)"}">')
+        if k.get("set"):
+            inp += f'<label class="check"><input type="checkbox" name="clear_{e(key)}"> Clear</label>'
+    else:
+        mode = {"number": ' inputmode="numeric"', "url": ' inputmode="url"', "time": ' placeholder="HH:MM"'}
+        lst = ' list="ssids"' if key.endswith("_SSID") else ""
+        inp = f'<input type="text" {attrs} value="{e(value)}"{mode.get(kind, "")}{lst} autocomplete="off">'
+    hint = k.get("hint", "") + (f' Default: {k["default"]}.' if k.get("default") and kind != "secret" else "")
+    err = f'<p class="error" id="{e(key)}-error">{e(error)}</p>' if error else ""
+    return (f'<div class="field"><label for="{e(key)}">{e(k["label"])}</label>{inp}{err}'
+            f'<p class="hint">{e(hint)}</p></div>')
+
+
+def form_changes(keys, form):
+    """Changed values from a settings form: blank secrets are left alone unless Clear is ticked."""
+    changes = {}
+    for k in keys:
+        key = k["key"]
+        if k["type"] == "secret":
+            if form.get(key):
+                changes[key] = form[key]
+            elif form.get(f"clear_{key}"):
+                changes[key] = ""
+        elif key in form and form[key] != k.get("value", ""):
+            changes[key] = form[key]
+    return changes
+
+
+def settings_form(keys, sess, action, form=None, error="", error_at=None, extra=""):
+    form = form or {}
+    fields = "".join(field(k, form.get(k["key"]) if k["type"] != "secret" else None,
+                           error if k["key"] == error_at else "") for k in keys)
+    return (f'<form method="post" action="{action}" class="card">{csrf_input(sess)}{fields}{extra}'
+            f'<button>Save</button></form>')
+
+
+def page_keys(wifi):
+    sch = schema()
+    return sch, [k for k in sch["keys"] if k["key"].startswith("WIFI") == wifi]
+
+
+# HTTP
+
+class Handler(BaseHTTPRequestHandler):
+    server_version, sys_version = "tvlink-console", ""
+    timeout = 60  # a client that stops sending frees its thread
+    sessions, limiter, tokens = Sessions(), Limiter(), Tokens(os.path.join(STATE, "tokens.json"))
+
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def do_DELETE(self):
+        self.route("DELETE")
+
+    # Replies
+
+    def reply(self, code, body, ctype="text/html; charset=utf-8", headers=()):
+        data = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; "
+                         "frame-ancestors 'none'; base-uri 'none'")
+        sess = getattr(self, "sess", None)
+        if sess and sess["auth"]:
+            self.send_header("X-CSRF-Token", sess["csrf"])  # for API calls made with the session
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def json(self, code, obj):
+        self.reply(code, json.dumps(obj, indent=1) + "\n", "application/json")
+
+    def redirect(self, to, cookie=None):
+        self.reply(303, "", headers=[("Location", to)] + ([("Set-Cookie", cookie)] if cookie else []))
+
+    def cookie(self, sid):
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""  # behind a tunnel
+        return f"tvlink={sid}; Path=/; HttpOnly; SameSite=Strict{secure}"
+
+    def start_session(self, auth):
+        """A new session (a new id after login: no fixation); its cookie."""
+        self.sessions.drop(self.sid)
+        self.sid = self.sessions.new(auth)
+        self.sess = self.sessions.get(self.sid)
+        return self.cookie(self.sid)
+
+    def anon(self):
+        """The session behind the login and claim forms, made if missing: (session, cookie or None)."""
+        if self.sess:
+            return None
+        return self.start_session(False)
+
+    def flash_back(self, to, msg, bad=False):
+        self.sess["flash"] = ("!" if bad else "") + msg
+        self.redirect(to)
+
+    def take_flash(self):
+        msg, self.sess["flash"] = self.sess["flash"], ""
+        return msg.lstrip("!"), msg.startswith("!")
+
+    # Requests
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 65536:
+            raise ValueError("Request too large")
+        return self.rfile.read(n).decode(errors="replace") if n else ""
+
+    def form(self):
+        return {k: v[0] for k, v in parse_qs(self.body(), keep_blank_values=True).items()}
+
+    def route(self, method):
+        url = urlsplit(self.path)
+        path, query = url.path, {k: v[0] for k, v in parse_qs(url.query).items()}
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except Exception:  # a malformed cookie header is just no session
+            pass
+        self.sid = jar["tvlink"].value if "tvlink" in jar else None
+        self.sess = self.sessions.get(self.sid)
+        try:
+            if path == "/console.css":
+                return self.reply(200, CSS, "text/css; charset=utf-8")
+            if path.startswith("/api/"):
+                return self.api(method, path, query)
+            return self.pages(method, path)
+        except ValueError as err:
+            return self.reply(400, str(err), "text/plain; charset=utf-8")
+
+    def csrf_ok(self, given):
+        return bool(self.sess and given and hmac.compare_digest(str(given), self.sess["csrf"]))
+
+    def pages(self, method, path):
+        ip = self.client_address[0]
+        if method not in ("GET", "POST"):
+            return self.reply(405, "Method not allowed", "text/plain")
+        if not claimed():
+            if path != "/claim":
+                return self.redirect("/claim")
+            return self.claim_page(method, ip)
+        if path == "/claim":
+            return self.redirect("/login")
+        if path == "/login":
+            return self.login_page(method, ip)
+        if not (self.sess and self.sess["auth"]):
+            return self.redirect("/login")
+        form = {}
+        if method == "POST":
+            form = self.form()
+            if not self.csrf_ok(form.get("csrf")):
+                return self.reply(403, page("Expired Form", '<p>The form expired or came from another site. '
+                                            '<a href="/">Start again</a>.</p>', self.sess))
+        handler = {"/": self.status_page, "/settings": self.settings_page, "/wifi": self.wifi_page,
+                   "/actions": self.actions_page, "/logs": self.logs_page, "/update": self.update_page,
+                   "/tokens": self.tokens_page, "/logout": self.logout, "/screenshot.jpg": self.screenshot}.get(path)
+        if not handler:
+            return self.reply(404, page("Not Found", '<p><a href="/">Back to Status</a></p>', self.sess))
+        return handler(method, form)
+
+    def claim_page(self, method, ip):
+        cookie, msg = self.anon(), ""
+        claim_code()
+        if method == "POST":
+            form = self.form()
+            if not self.csrf_ok(form.get("csrf")):
+                msg = "The form expired. Try again."
+            elif self.limiter.blocked(ip):
+                msg = "Too many tries. Wait a few minutes."
+            else:
+                msg = claim(form.get("code", ""), form.get("password", ""), form.get("repeat", ""))
+                if msg is None:
+                    return self.redirect("/", self.start_session(True))
+                if msg == "Wrong claim code":
+                    self.limiter.fail(ip)
+        body = (f'<div class="narrow"><p>This unit has no password yet. Enter the code shown on its TV (or from '
+                f'<code>sudo tvlink console claim</code>) and choose the console password.</p>'
+                f'<form method="post" action="/claim" class="card">{csrf_input(self.sess)}'
+                f'<div class="field"><label for="code">Claim Code</label><input id="code" name="code" '
+                f'autocomplete="off" autocapitalize="characters" placeholder="ABC-123" required></div>'
+                f'<div class="field"><label for="password">New Password</label><input type="password" id="password" '
+                f'name="password" autocomplete="new-password" minlength="{MIN_PASSWORD}" required>'
+                f'<p class="hint">At least {MIN_PASSWORD} characters.</p></div>'
+                f'<div class="field"><label for="repeat">Repeat Password</label><input type="password" id="repeat" '
+                f'name="repeat" autocomplete="new-password" required></div><button>Claim This Unit</button>'
+                f'</form></div>')
+        self.reply(400 if msg else 200, page("Claim This Unit", body, self.sess, flash=msg, bad=True),
+                   headers=[("Set-Cookie", cookie)] if cookie else [])
+
+    def login_page(self, method, ip):
+        if self.sess and self.sess["auth"]:
+            return self.redirect("/")
+        cookie, msg = self.anon(), ""
+        if method == "POST":
+            form = self.form()
+            if not self.csrf_ok(form.get("csrf")):
+                msg = "The form expired. Try again."
+            elif self.limiter.blocked(ip):
+                msg = "Too many tries. Wait a few minutes."
+            elif check_password(form.get("password", ""), read_file(os.path.join(STATE, "password")) or ""):
+                return self.redirect("/", self.start_session(True))
+            else:
+                self.limiter.fail(ip)
+                msg = "Wrong password"
+        body = (f'<div class="narrow"><form method="post" action="/login" class="card">{csrf_input(self.sess)}'
+                f'<div class="field"><label for="password">Password</label><input type="password" id="password" '
+                f'name="password" autocomplete="current-password" autofocus required></div>'
+                f'<button>Log In</button></form><p class="hint">Forgotten it? On the unit: '
+                f'<code>sudo tvlink console reset</code>.</p></div>')
+        self.reply(401 if msg else 200, page("Log In", body, self.sess, flash=msg, bad=True),
+                   headers=[("Set-Cookie", cookie)] if cookie else [])
+
+    def logout(self, method, form):
+        if method != "POST":
+            return self.redirect("/")
+        self.sessions.drop(self.sid)
+        self.redirect("/login", "tvlink=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")
+
+    def screenshot(self, method, form):
+        data, _ = screen()
+        if data is None:
+            return self.reply(404, "No screenshot yet", "text/plain")
+        self.reply(200, data, "image/jpeg")
+
+    def status_page(self, method, form):
+        s = status()
+        flash, bad = self.take_flash()
+        level = "live" if s["state"] == "ready" else "bad" if s["state"] == "network" else ""
+        shot = (f'<img src="/screenshot.jpg?{s["screenshot"]}" alt="What the TV shows">' if s["screenshot"]
+                else '<div class="noshot">No screenshot yet</div>')
+        taken = time.strftime("Taken %H:%M:%S", time.localtime(s["screenshot"])) if s["screenshot"] else ""
+        rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
+                ("TV", e(s["tv"].capitalize())), ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
+                ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
+        body = (f'<div class="grid"><figure>{shot}<figcaption><span>{taken}</span>'
+                f'<form method="post" action="/actions">{csrf_input(self.sess)}<input type="hidden" name="back" '
+                f'value="/"><button class="quiet" name="action" value="screenshot">Take Screenshot</button></form>'
+                f'</figcaption></figure><section><dl>'
+                + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+                + f'</dl></section></div><h2>Health</h2><pre>{e(chr(10).join(s["health"]))}</pre>')
+        self.reply(200, page("Status", body, self.sess, "/", flash, bad))
+
+    def settings_page(self, method, form, wifi=False):
+        path, title = ("/wifi", "Wi-Fi") if wifi else ("/settings", "Settings")
+        sch, keys = page_keys(wifi)
+        flash, bad, error, at = "", False, "", None
+        if method == "POST":
+            ok, msg, at = save(form_changes(keys, form))
+            if ok:
+                return self.flash_back(path, msg)
+            if at:
+                error, flash = msg, "Not saved: see below"
+            else:
+                flash = msg
+            bad = True
+        else:
+            flash, bad = self.take_flash()
+            form = None
+        extra, body = "", ""
+        if wifi:
+            nets = networks()
+            extra = '<datalist id="ssids">' + "".join(f'<option value="{e(n["ssid"])}">' for n in nets) + "</datalist>"
+            rows = "".join(f'<tr><td>{e(n["ssid"])}</td><td>{n["signal"]}%</td><td>{e(n["security"])}</td></tr>'
+                           for n in nets) or '<tr><td colspan="3">None seen</td></tr>'
+            body = (f'<h2>Visible Networks</h2><section><table><thead><tr><th>Network</th><th>Signal</th>'
+                    f'<th>Security</th></tr></thead><tbody>{rows}</tbody></table></section>')
+            intro = ("<p>Up to two networks, besides the one set in Imager. Changes apply at once; a unit on Wi-Fi "
+                     "may drop off for a moment.</p>")
+        else:
+            intro = "<p>Saved to tvlink.conf on the SD card; the parts that use a setting restart by themselves.</p>"
+        if sch.get("error"):
+            flash, bad = sch["error"], True
+        form_html = settings_form(keys, self.sess, path, form, error, at, extra)
+        self.reply(400 if bad and method == "POST" else 200,
+                   page(title, intro + form_html + body, self.sess, path, flash, bad))
+
+    def wifi_page(self, method, form):
+        self.settings_page(method, form, wifi=True)
+
+    def actions_page(self, method, form):
+        if method == "POST":
+            action, back = form.get("action", ""), form.get("back")
+            back = back if back in ("/", "/actions") else "/actions"
+            if action not in ACTIONS:
+                return self.flash_back(back, f"Unknown action: {action}", True)
+            ok, out, err = tvlink(action, timeout=60)
+            return self.flash_back(back, out or err or ("Done" if ok else "Failed"), not ok)
+        flash, bad = self.take_flash()
+        cards = [("reload", "Reload Page", "Reloads the page on the TV."),
+                 ("identify", "Identify", "The unit's name and IP across the TV for up to a minute."),
+                 ("screenshot", "Take Screenshot", "What the TV shows now, on the Status page."),
+                 ("on", "TV On", "Wakes the TV over HDMI-CEC and switches it to the Pi."),
+                 ("off", "TV Off", "Puts the TV in standby. The power mode may wake it again.")]
+        csrf = csrf_input(self.sess)
+        body = '<div class="actions">' + "".join(
+            f'<form method="post" action="/actions" class="card">{csrf}<strong>{label}</strong><p>{hint}</p>'
+            f'<button name="action" value="{a}">{label}</button></form>' for a, label, hint in cards)
+        body += (f'<div class="card"><strong>Reboot</strong><p>The TV shows the splash for about a minute.</p>'
+                 f'<details><summary class="button danger"><span class="closed">Reboot</span><span class="open">Cancel'
+                 f'</span></summary><form method="post" action="/actions" class="row">{csrf}<span>Reboot now?</span>'
+                 f'<button class="danger" name="action" value="reboot">Reboot Now</button></form></details></div>'
+                 f'</div>')
+        self.reply(200, page("Actions", body, self.sess, "/actions", flash, bad))
+
+    def logs_page(self, method, form):
+        names = {"kiosk": "Kiosk", "power": "TV Power", "net": "Wi-Fi Networks"}
+        body = "".join(f"<h2>{names[w]}</h2><pre>{e(text) or 'Nothing yet'}</pre>" for w, text in logs().items())
+        self.reply(200, page("Logs", "<p>The last 200 lines of each, newest last.</p>" + body, self.sess, "/logs"))
+
+    def update_page(self, method, form):
+        if method == "POST":
+            ok, out, err = tvlink("update", form.get("url", "").strip(), form.get("sha256", "").strip().lower(),
+                                  timeout=330)
+            return self.flash_back("/update", out or err or "Failed", not ok)
+        flash, bad = self.take_flash()
+        csrf = csrf_input(self.sess)
+        body = (f'<p>Installed: tvlink {e(schema().get("version") or "")}. Install a commit of main by its archive URL '
+                f'and SHA-256; a wrong checksum installs nothing.</p><form method="post" action="/update" '
+                f'class="card">{csrf}<div class="field"><label for="url">Archive URL</label><input id="url" '
+                f'name="url" inputmode="url" placeholder="https://github.com/seslhq/tvlink/archive/COMMIT.tar.gz" '
+                f'required></div><div class="field"><label for="sha256">SHA-256</label><input id="sha256" '
+                f'name="sha256" autocomplete="off" pattern="[0-9a-fA-F]{{64}}" required><p class="hint">On your '
+                f'computer: <code>curl -sL URL | shasum -a 256</code></p></div><button>Install</button></form>')
+        self.reply(200, page("Update", body, self.sess, "/update", flash, bad))
+
+    def tokens_page(self, method, form):
+        flash, bad, made = "", False, ""
+        if method == "POST":
+            if form.get("revoke"):
+                ok = self.tokens.revoke(form["revoke"])
+                return self.flash_back("/tokens", f"Revoked {form['revoke']}" if ok else "No such token", not ok)
+            try:
+                token = self.tokens.create(form.get("name", ""))
+                made = (f'<section><label for="token">Token for {e(form["name"].strip())}</label>'
+                        f'<input id="token" class="secret" value="{e(token)}" readonly>'
+                        f'<p class="hint">Copy it now: it is shown only once.</p></section>')
+            except ValueError as err:
+                flash, bad = str(err), True
+        else:
+            flash, bad = self.take_flash()
+        csrf = csrf_input(self.sess)
+        rows = "".join(
+            f'<tr><td>{e(t["name"])}</td><td>{e(t["created"])}</td><td><details><summary class="button quiet">'
+            f'<span class="closed">Revoke</span><span class="open">Cancel</span></summary>'
+            f'<form method="post" action="/tokens" class="row">{csrf}<button class="danger" '
+            f'name="revoke" value="{e(t["name"])}">Revoke {e(t["name"])}</button></form></details></td></tr>'
+            for t in self.tokens.list()) or '<tr><td colspan="3">None yet</td></tr>'
+        body = (f'<p>For fleet management and scripts: send <code>Authorization: Bearer TOKEN</code> to /api/. A token '
+                f'can do anything the console can.</p>{made}<h2>Tokens</h2><section><table><thead><tr><th>Name</th>'
+                f'<th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>'
+                f'<h2>New Token</h2><form method="post" action="/tokens" class="card">{csrf}<div class="field">'
+                f'<label for="name">Name</label><input id="name" name="name" maxlength="40" placeholder="fleet" '
+                f'required></div><button>Create Token</button></form>')
+        self.reply(400 if bad and method == "POST" else 200, page("API Tokens", body, self.sess, "/tokens", flash, bad))
+
+    # API
+
+    def api(self, method, path, query):
+        auth = self.headers.get("Authorization", "")
+        who = None
+        if auth.startswith("Bearer "):
+            who = self.tokens.check(auth[7:].strip())
+        elif self.sess and self.sess["auth"]:
+            who = "session"
+            if method != "GET" and not self.csrf_ok(self.headers.get("X-CSRF-Token")):
+                return self.json(403, {"error": "Missing or wrong X-CSRF-Token"})
+        if not who:
+            return self.json(401, {"error": "Log in, or send an API token: Authorization: Bearer TOKEN"})
+        data = {}
+        if method == "POST":
+            try:
+                data = json.loads(self.body() or "{}")
+            except ValueError:
+                return self.json(400, {"error": "Body is not JSON"})
+            if not isinstance(data, dict):
+                return self.json(400, {"error": "Body is a JSON object"})
+        route = (method, path)
+        if route == ("GET", "/api/status"):
+            return self.json(200, status())
+        if route == ("GET", "/api/settings"):
+            return self.json(200, schema())
+        if route == ("POST", "/api/settings"):
+            ok, msg, key = save({str(k): v for k, v in data.items()})
+            return self.json(200 if ok else 400, {"ok": True, "message": msg} if ok else {"error": msg, "key": key})
+        if route == ("POST", "/api/action"):
+            action = data.get("action")
+            if action not in ACTIONS:
+                return self.json(400, {"error": f"action is one of {', '.join(ACTIONS)}"})
+            ok, out, err = tvlink(action, timeout=60)
+            return self.json(200 if ok else 500, {"ok": ok, "message": out or err})
+        if path == "/api/screenshot" and method in ("GET", "POST"):
+            if method == "POST":
+                ok, out, err = tvlink("screenshot", timeout=60)
+                if not ok:
+                    return self.json(500, {"error": err or out})
+            data, _ = screen()
+            return self.reply(200, data, "image/jpeg") if data else self.json(404, {"error": "No screenshot yet"})
+        if route == ("GET", "/api/logs"):
+            which = query.get("part", "")
+            if which and which not in LOGS:
+                return self.json(400, {"error": f"part is one of {', '.join(LOGS)}"})
+            return self.json(200, logs((which,) if which else LOGS))
+        if route == ("GET", "/api/wifi"):
+            return self.json(200, {"networks": networks()})
+        if route == ("POST", "/api/update"):
+            ok, out, err = tvlink("update", str(data.get("url", "")), str(data.get("sha256", "")), timeout=330)
+            return self.json(200 if ok else 400, {"ok": ok, "message": out or err})
+        if route == ("GET", "/api/tokens"):
+            return self.json(200, {"tokens": self.tokens.list()})
+        if route == ("POST", "/api/tokens"):
+            try:
+                return self.json(200, {"name": str(data.get("name", "")).strip(),
+                                       "token": self.tokens.create(str(data.get("name", "")))})
+            except ValueError as err:
+                return self.json(400, {"error": str(err)})
+        if method == "DELETE" and path.startswith("/api/tokens/"):
+            name = unquote(path[len("/api/tokens/"):])
+            ok = self.tokens.revoke(name)
+            return self.json(200 if ok else 404, {"ok": True} if ok else {"error": "No such token"})
+        return self.json(404, {"error": "Not found"})
+
+
+class Server(ThreadingHTTPServer):
+    """IPv6 and IPv4 on one socket."""
+    address_family, daemon_threads = socket.AF_INET6, True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def main():
+    claim_code()
+    try:
+        server = Server(("::", PORT), Handler)
+    except OSError:  # no IPv6
+        server = ThreadingHTTPServer(("", PORT), Handler)
+    print(f"Console on port {PORT}, {'claimed' if claimed() else 'claim mode'}", flush=True)
+    server.serve_forever()
+
+
+def test():
+    import tempfile
+    global STATE, RUN
+    stored = hash_password("correct horse", 1000)
+    assert stored.startswith("pbkdf2_sha256$1000$") and check_password("correct horse", stored)
+    assert not check_password("wrong horse", stored) and not check_password("x", "") and not check_password("x", None)
+    assert hash_password("correct horse", 1000) != stored  # salted
+    code = new_code()
+    assert re.fullmatch(r"[A-HJ-NP-Z2-9]{3}-[A-HJ-NP-Z2-9]{3}", code), code
+    assert code_matches(code.lower().replace("-", " "), code) and not code_matches("", "")
+    assert not code_matches(code, "")
+    # Sessions: anonymous ones are capped, expiry holds, ids rotate
+    ss = Sessions()
+    sid = ss.new(True)
+    assert ss.get(sid)["auth"] and len(ss.get(sid)["csrf"]) > 30 and ss.get("nope") is None and ss.get(None) is None
+    for _ in range(MAX_ANON + 50):
+        ss.new()
+    assert ss.get(sid) and sum(not v["auth"] for v in ss.data.values()) <= MAX_ANON
+    ss.data[sid]["expires"] = time.time() - 1
+    assert ss.get(sid) is None
+    # Rate limit: per client, then for everyone, and the window slides
+    lim = Limiter(3, 60)
+    for _ in range(3):
+        assert not lim.blocked("192.0.2.1", 100)
+        lim.fail("192.0.2.1", 100)
+    assert lim.blocked("192.0.2.1", 100) and not lim.blocked("192.0.2.2", 100) and not lim.blocked("192.0.2.1", 161)
+    for i in range(12):
+        lim.fail(f"198.51.100.{i}", 200)
+    assert lim.blocked("203.0.113.9", 200)
+    # Settings: fields from the schema, secrets write-only, changes only, errors find their key
+    keys = [{"key": "POWER_MODE", "type": "choice", "label": "Power Mode", "hint": "", "value": "schedule",
+             "default": "schedule", "choices": ["always", "schedule"]},
+            {"key": "BOARD_URL", "type": "url", "label": "Board URL", "hint": "Page.", "value": 'https://e.example/"<',
+             "default": ""},
+            {"key": "WIFI1_PSK", "type": "secret", "label": "Password 1", "hint": "", "value": "", "default": "",
+             "set": True},
+            {"key": "NEW_KEY", "type": "text", "label": "NEW_KEY", "hint": "", "value": "x", "default": "y"}]
+    out = "".join(field(k) for k in keys)
+    assert "<option selected>schedule</option>" in out and 'value="https://e.example/&quot;&lt;"' in out
+    assert 'placeholder="(set)"' in out and 'name="clear_WIFI1_PSK"' in out and 'name="NEW_KEY"' in out
+    assert "Default: y." in out and re.search(r'<input type="password"[^>]*>', out).group().count("value=") == 0
+    assert 'aria-invalid="true"' in field(keys[0], "bogus", "POWER_MODE is ...") and "<option selected>bogus" in field(
+        keys[0], "bogus")
+    form = {"POWER_MODE": "always", "BOARD_URL": 'https://e.example/"<', "WIFI1_PSK": "", "NEW_KEY": "x"}
+    assert form_changes(keys, form) == {"POWER_MODE": "always"}
+    assert form_changes(keys, {**form, "clear_WIFI1_PSK": "on"})["WIFI1_PSK"] == ""
+    assert form_changes(keys, {**form, "WIFI1_PSK": "new-pass-1"})["WIFI1_PSK"] == "new-pass-1"
+    assert error_key("WIFI1_PSK is 8 to 63 characters", ["WIFI1_SSID", "WIFI1_PSK"]) == "WIFI1_PSK"
+    assert error_key("Unknown setting: FOO=1 (keys: ...)", ["FOO"]) == "FOO" and error_key("Can't write", ["A"]) is None
+    assert save({"bad key": "1"})[0] is False and save({"A": 1})[0] is False and save({}) == (True, "Nothing changed",
+                                                                                                None)
+    with tempfile.TemporaryDirectory() as tmp:
+        STATE, RUN = tmp, tmp
+        # Tokens: shown once, stored hashed, checked, revoked
+        toks = Tokens(os.path.join(tmp, "tokens.json"))
+        token = toks.create("fleet")
+        assert token.startswith("tvl_") and token not in read_file(toks.path)
+        assert toks.check(token) == "fleet" and toks.check(token + "x") is None and toks.check("") is None
+        assert [t["name"] for t in toks.list()] == ["fleet"] and os.stat(toks.path).st_mode & 0o777 == 0o600
+        for bad in ("", "a" * 41, "fleet", "<b>"):
+            try:
+                toks.create(bad)
+                raise AssertionError(bad)
+            except ValueError:
+                pass
+        assert toks.revoke("fleet") and not toks.revoke("fleet") and toks.check(token) is None
+        # Claim: needs the code, a long enough password, twice; then the code is gone
+        code = claim_code()
+        assert code and claim_code() == code and not claimed()
+        assert claim("AAA-AAA" if code != "AAA-AAA" else "BBB-BBB", "long enough pw", "long enough pw") == \
+            "Wrong claim code"
+        assert claim(code, "short", "short").startswith("Use at least")
+        assert claim(code, "long enough pw", "other one") == "The passwords don't match"
+        assert claim(code, "long enough pw", "long enough pw") is None and claimed()
+        assert check_password("long enough pw", read_file(os.path.join(tmp, "password")))
+        assert claim_code() == "" and claim(code, "long enough pw", "long enough pw") == "Already claimed"
+    assert duration(59) == "0 min" and duration(3700) == "1 h 1 min" and duration(90000) == "1 d 1 h"
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["test"]:
+        test()
+    elif len(sys.argv) == 1:
+        main()
+    else:
+        sys.exit(__doc__)

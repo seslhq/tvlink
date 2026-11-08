@@ -10,10 +10,12 @@ Run before every change; CI runs the same on every push and pull request:
 shellcheck tvlink install.sh tests/*.sh
 python3 tvlink-power test
 python3 tvlink-agent test
+python3 tvlink-console test
 ```
 
 The self-tests cover the settings parser (through `tvlink show`), the power modes, presence and clock logic (including
-clock changes), and the badge.
+clock changes), the badge, and the console's password hashing, sessions, CSRF tokens, login rate limit, settings
+forms and API tokens.
 
 ## The VM
 
@@ -29,7 +31,7 @@ tests/vm.sh
 
 - **First run:** makes the VM and installs, about 10 min. It downloads Debian 13's generic arm64 image (about
   0.5 GB) and the packages, including Chromium. A window shows the VM's screen (tty1, where cage runs).
-- **Later runs:** reinstall from this checkout and run the checks again, in about 3 min.
+- **Later runs:** reinstall from this checkout and run the checks again, in about 4 min.
 - **Exploring:** `limactl shell tvlink` opens a shell in the VM. The repo is mounted read-only at the same path.
 - **Starting over:** `limactl delete -f tvlink`.
 
@@ -56,7 +58,13 @@ tests/vm.sh
   Ethernet-out network check;
 - the splash handing over to the board, the live badge, and a screenshot;
 - the kiosk user's limits: the render group only, no polkit rights, and a home it can't write;
-- nothing written to the kiosk's home, and `/run/tvlink` staying small.
+- nothing written to the kiosk's home, and `/run/tvlink` staying small;
+- the console: the claim code from `tvlink console claim` and on the splash, a wrong code refused, claiming sets a
+  PBKDF2 password, login (a wrong password refused), a form without its CSRF token and an API call without its CSRF
+  header refused, the API refused with no session or token, the console user unable to run other commands as root,
+  an API token (stored hashed only) reloading the page and fetching the screenshot, then revoked and refused, a
+  settings round trip through the API (`OVERLAY_CORNER`, not logged by sudo, a bad value refused with its key), and
+  the claim code gone from the splash once claimed. The checks use curl against `http://127.0.0.1` inside the VM.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
@@ -104,5 +112,8 @@ or after a change that touches them, check on the bench with a fresh card and re
 - With a keyboard: F12, Ctrl+Shift+I, Ctrl+O and Ctrl+S do nothing useful.
 - `tvlink screenshot` matches the TV; `identify` and `reload` work; `tvlink update` refuses a wrong checksum and
   installs a good commit.
+- Console from a phone on the site Wi-Fi: `http://<name>.local` resolves (else the IP), the claim code on the TV
+  works once, every page reads well on a phone, the Status screenshot matches the TV, Reboot comes back on its own,
+  an update from the Update page restarts the console, and a login takes under 2 s (PBKDF2 on the Pi).
 
 Reports from your own hardware are welcome as issues: the Pi model, the TV model, and which of these passed.

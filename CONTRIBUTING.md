@@ -10,14 +10,15 @@ Before a pull request, run (with shellcheck installed):
 shellcheck tvlink install.sh tests/*.sh
 python3 tvlink-power test
 python3 tvlink-agent test
+python3 tvlink-console test
 ```
 
-A change to install.sh, the units, CEC, Wi-Fi or the kiosk also needs `tests/vm.sh`
+A change to install.sh, the units, CEC, Wi-Fi, the kiosk or the console also needs `tests/vm.sh`
 ([docs/testing.md](docs/testing.md)). It runs on an Apple silicon Mac only: if you can't run it, say so in the pull
 request and the maintainer will.
 
 Style: bash and Python 3, no new dependencies; lines up to 120 columns; short comments; tests are the assert-based
-`test` command in tvlink-power and tvlink-agent.
+`test` command in tvlink-power, tvlink-agent and tvlink-console.
 
 Contributions are under the repo's licence (Apache-2.0, section 5); there is no CLA. Redact page keys, IP addresses
 and Wi-Fi names in anything you post.

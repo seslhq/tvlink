@@ -13,8 +13,8 @@ Started by `tvlink browser` inside cage, as the kiosk user. It runs Chromium wit
   the kiosk with a fresh browser.
 Every 30 s it runs `tvlink mode`, which sets the HDMI mode again if the TV came back at its own (hotplug in
 standby). It also takes one-word requests from the tvlink CLI in /run/tvlink/request: identify (name and IP big
-on screen for up to 60 s, or until the page reloads), screenshot (JPEG to /run/tvlink/screen.jpg) and reload.
-It sends no CEC and needs no root.
+on screen for up to 60 s, or until the page reloads; also the console's claim code while it has one), screenshot
+(JPEG to /run/tvlink/screen.jpg) and reload. It sends no CEC and needs no root.
 """
 import base64
 import fcntl
@@ -250,6 +250,8 @@ def main(argv):
                 os.replace(SCREEN + ".tmp", SCREEN)
             elif request == "identify":
                 name = f"{status.get('name') or socket.gethostname()}\n{status.get('ip') or ''}".strip()
+                if status.get("claim"):  # the unit console has no password yet
+                    name += f"\nConsole code {status['claim']}"
                 browser.send("Runtime.evaluate", {"expression": IDENTIFY % json.dumps(name), "returnByValue": True},
                              session)
             if request:

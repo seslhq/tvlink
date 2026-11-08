@@ -33,13 +33,15 @@ Image every unit fresh; never clone a configured card (clones share SSH host key
    ssh -t <user>@tv-lobby-01.local sudo ./tvlink/install.sh
    ```
 
-3. Set the page: `sudo tvlink set BOARD_URL=https://...`, or leave it blank for local content only
-   ([configuration](configuration.md)).
-4. Test the TV: `sudo tvlink off`, wait 10 s, `sudo tvlink on`, then `tvlink status` should say `on`. If not, see
+3. Claim the console: open `http://tv-lobby-01.local` on a phone or laptop on the same network, enter the code the
+   TV shows (or `sudo tvlink console claim` prints) and choose its password ([console](console.md)).
+4. Set the page in the console's Settings, or `sudo tvlink set BOARD_URL=https://...`; leave it blank for local
+   content only ([configuration](configuration.md)).
+5. Test the TV: `sudo tvlink off`, wait 10 s, `sudo tvlink on`, then `tvlink status` should say `on`. If not, see
    the CEC section below.
-5. Remote access: `rpi-connect on`, then `rpi-connect signin` with a shared fleet Raspberry Pi ID (2FA on), never a
-   personal one.
-6. `sudo reboot`. Check the page comes up and `rpi-connect status` shows signed in, then label the unit with its
+6. Break-glass access: `rpi-connect on`, then `rpi-connect signin` with a shared fleet Raspberry Pi ID (2FA on),
+   never a personal one.
+7. `sudo reboot`. Check the page comes up and `rpi-connect status` shows signed in, then label the unit with its
    hostname.
 
 ## TV settings and HDMI-CEC

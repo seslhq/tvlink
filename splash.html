@@ -20,6 +20,8 @@
   h1 { font-size: 3.2vw; font-weight: 600; margin: 7vh 0 2vh; }
   p { font-size: 1.9vw; line-height: 1.4; color: var(--muted); margin: 0; max-width: 62vw; }
   code { color: var(--paper); }
+  #claim { font-size: 1.5vw; margin-top: 4vh; }
+  #claim b { color: var(--paper); font-weight: 600; margin: 0 1.5em 0 .3em; }
   footer { position: absolute; left: 10vw; right: 10vw; bottom: 10vh; display: grid;
     grid-template-columns: 1fr auto 1fr; font-size: 1.5vw; color: var(--muted); transition: transform 2s; }
   footer :last-child { text-align: right; }
@@ -45,6 +47,7 @@
   </svg>
   <h1 id="title"></h1>
   <p id="detail"></p>
+  <p id="claim" hidden>Console:<b id="claim-url"></b>Code:<b id="claim-code"></b></p>
 </main>
 <footer id="foot"><span id="device"></span><span id="clock"></span><span>github.com/seslhq/tvlink</span></footer>
 <div id="show" hidden></div>
@@ -76,6 +79,10 @@
     $("title").textContent = title;
     if (detail === null) $("detail").innerHTML = SETUP; else $("detail").textContent = detail;
     $("dot").style.fill = `var(${dot})`;
+    // Until the unit console has a password: where it is, and the one-time code that claims it.
+    $("claim").hidden = !s.claim;
+    $("claim-url").textContent = `http://${s.name}.local`;
+    $("claim-code").textContent = s.claim || "";
     $("device").textContent = [s.name, s.ip || "No IP", s.version && `v${s.version}`].filter(Boolean).join(" · ");
   }
 

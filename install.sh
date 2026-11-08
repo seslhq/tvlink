@@ -13,7 +13,7 @@ CONF=$BOOT/tvlink.conf
 apt-get update
 # --no-upgrade: installed packages update on the unattended-upgrades schedule, and a held one does not stop this.
 apt-get install -y --no-upgrade cage wlr-randr chromium v4l-utils unattended-upgrades curl python3-gpiozero \
-  python3-lgpio
+  python3-lgpio sudo
 
 # Daily security updates, plus the Raspberry Pi repo that ships Chromium.
 cat >/etc/apt/apt.conf.d/52tvlink <<'EOF'
@@ -37,9 +37,14 @@ printf 'polkit.addRule(function (a, s) { if (s.user == "kiosk") return polkit.Re
   >/etc/polkit-1/rules.d/10-tvlink.rules
 grep -qx kiosk /etc/cron.deny 2>/dev/null || echo kiosk >>/etc/cron.deny
 
-install -m 755 tvlink tvlink-power tvlink-agent /usr/local/bin/
+# The unit console runs as its own user, with root only for the tvlink commands in its sudoers file.
+id tvlink-console >/dev/null 2>&1 || useradd --system -M -d /nonexistent -s /usr/sbin/nologin tvlink-console
+visudo -cqf tvlink-console.sudoers || { echo "tvlink-console.sudoers does not parse" >&2; exit 1; }
+install -m 440 tvlink-console.sudoers /etc/sudoers.d/tvlink-console
+
+install -m 755 tvlink tvlink-power tvlink-agent tvlink-console /usr/local/bin/
 install -m 644 tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.service tvlink-reboot.timer \
-  /etc/systemd/system/
+  tvlink-console.service /etc/systemd/system/
 install -D -m 644 splash.html /usr/share/tvlink/splash.html
 [ -e "$CONF" ] || install -m 644 tvlink.conf.example "$CONF"
 install -d "$BOOT/tvlink" # local content, see SOURCE
@@ -84,8 +89,9 @@ grep -q '^disable_splash=1' "$BOOT/config.txt" || printf '\n[all]\ndisable_splas
 [ -z "${SUDO_USER:-}" ] || loginctl enable-linger "$SUDO_USER"
 
 systemctl daemon-reload
-systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer
-# An update takes effect now; a first install starts at the next boot.
+systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer tvlink-console.service
+# An update takes effect now; a first install starts at the next boot, except the console, so it can be claimed now.
 systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service
+systemctl restart tvlink-console.service
 
 echo "Installed tvlink $(./tvlink show | sed -n 's/^VERSION=//p'). First install: set BOARD_URL if needed, then reboot."

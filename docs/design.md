@@ -23,6 +23,7 @@ page itself (eg pixel shift or a night theme), captive portals and WPA-Enterpris
 | `tvlink-agent` | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, takes requests (screenshot, identify, reload) |
 | `tvlink-power` | root | The only user of CEC and the motion sensor: power modes, clock trust, power-cut handling |
 | `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
+| `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
 | `tvlink check` | root | Gate for the nightly reboot timer |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
 
@@ -65,7 +66,25 @@ badge state in over the DevTools pipe instead.
   autostart), a managed policy blocking DevTools, browser pages, file dialogs and downloads. Root hands it requests
   through files in `/run/tvlink`, without a controlling terminal.
 - **Watchdog and Wi-Fi.** systemd's hardware watchdog reboots a hung kernel; Wi-Fi power save is off.
-- **Remote access is not tvlink's job.** Raspberry Pi Connect (or any shell) reaches the CLI; tvlink opens no port.
+- **A console on every unit, on by default, claimed with a code.** Day-to-day management is the unit's own console;
+  Raspberry Pi Connect or SSH stay as break-glass. It is on from the first install so a unit can be set up from a
+  phone, but until a password is set it serves only the claim page, which needs a one-time code shown on the TV (and
+  printed by `sudo tvlink console claim`): being on the network is not enough to take a unit. The code lives in
+  `/run/tvlink-console`, readable by the splash; it is no secret from anyone who can read the TV.
+- **Port 80, not 8080.** People type a unit's name, and a tunnel maps a hostname to it either way. The console binds
+  port 80 as an unprivileged user through `AmbientCapabilities=CAP_NET_BIND_SERVICE`; nothing else on the unit
+  listens. Plain HTTP on the LAN; HTTPS is the tunnel's job.
+- **Privilege model.** The console runs as `tvlink-console` in a systemd sandbox (read-only system, private `/tmp`, no
+  home directories, other users' processes hidden). Root is reachable only through `/etc/sudoers.d/tvlink-console`: an
+  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set` and `update`, which check every
+  argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
+  process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run` when sudo starts it for
+  the console: its commands then run as from a root shell. sudo does not log these commands, since `tvlink set` can
+  carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from
+  parsing human output; the settings form is built from `tvlink keys --json`, so a new key shows up by itself.
+- **Logins kept simple.** One password per unit (PBKDF2-SHA256), sessions in memory, a CSRF token on every change, a
+  login rate limit, and per-unit API tokens stored hashed for fleet tools. No accounts, no roles: anyone who can log
+  in can do everything, including updates.
 
 ## Platform facts
 

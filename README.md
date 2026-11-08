@@ -31,23 +31,31 @@ drops and browser crashes without a site visit.
 - **TV power over HDMI-CEC.** Always on, on-hours, a motion sensor, the TV remote, or the remote plus motion wake.
 - **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
   and security updates staged so a few units take them first.
-- **Managed remotely.** One text file on the SD card holds the settings, editable on any PC or with `tvlink set`
-  over Raspberry Pi Connect or SSH. `tvlink doctor` shows the unit's health; `tvlink screenshot` shows the screen.
+- **A console on every unit.** Web pages and a JSON API on the unit itself: the screen, health, settings, actions,
+  logs, Wi-Fi, updates and API tokens, from a phone on site or through a tunnel. Claimed with a one-time code from
+  the TV ([docs/console.md](docs/console.md)).
+
+  ![The console's Status page](docs/images/console-status.png)
+
+- **Managed remotely.** One text file on the SD card holds the settings, editable on any PC, in the console, or with
+  `tvlink set` over Raspberry Pi Connect or SSH, which stay as a way in when the console can't be reached.
 
 ## How it works
 
 ```
 TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
-                         tvlink.service        cage + Chromium on tty1: splash until the page answers, then the page;
-                                               tvlink-agent drives Chromium over a DevTools pipe (badge, recovery)
-                         tvlink-power.service  TV power over CEC: schedule, motion sensor, power-cut wake
-                         tvlink-net.service    Wi-Fi networks from the settings file
-                         tvlink-reboot.timer   nightly reboot, gated on the page answering
-                         /boot/firmware        tvlink.conf and the local content folder (FAT: any PC can edit it)
+                         tvlink.service          cage + Chromium on tty1: splash until the page answers, then the
+                                                 page; tvlink-agent drives Chromium over a DevTools pipe (badge,
+                                                 recovery)
+                         tvlink-power.service    TV power over CEC: schedule, motion sensor, power-cut wake
+                         tvlink-net.service      Wi-Fi networks from the settings file
+                         tvlink-console.service  the console on port 80: web pages and JSON API
+                         tvlink-reboot.timer     nightly reboot, gated on the page answering
+                         /boot/firmware          tvlink.conf and the local content folder (FAT: any PC can edit it)
 ```
 
-Bash, Python 3 and systemd; no build step, no containers, nothing listening on the network. The
-design and the reasons behind it: [docs/design.md](docs/design.md).
+Bash, Python 3 and systemd; no build step, no containers, no dependencies beyond Raspberry Pi OS packages. The only
+thing listening on the network is the console. The design and the reasons behind it: [docs/design.md](docs/design.md).
 
 ## Quick start
 
@@ -64,14 +72,15 @@ microSD card, a micro-HDMI cable, and a TV with HDMI-CEC turned on.
    ssh -t <user>@tv-lobby-01.local sudo ./tvlink/install.sh
    ```
 
-3. Point it at a page, then reboot: `sudo tvlink set BOARD_URL=https://dashboard.example.com/board`.
+3. Claim its console at `http://tv-lobby-01.local` with the code on the TV, point it at a page in Settings (or
+   `sudo tvlink set BOARD_URL=https://dashboard.example.com/board`), then reboot.
 
 The full guide, including TV settings and the CEC test: [docs/setup.md](docs/setup.md).
 
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC), Wi-Fi and the
-motion sensor, and runs 32 checks against the real services: [docs/testing.md](docs/testing.md).
+motion sensor, and runs 59 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
@@ -79,6 +88,7 @@ motion sensor, and runs 32 checks against the real services: [docs/testing.md](d
 | --- | --- |
 | [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor |
 | [Configuration](docs/configuration.md) | Every setting, power modes, local content |
+| [Console](docs/console.md) | The unit's web pages and JSON API, claiming, security |
 | [Operations](docs/operations.md) | Remote management, updates, troubleshooting, on-site notes, replacing a unit |
 | [Design](docs/design.md) | How the parts fit, the decisions behind them, platform facts |
 | [Testing](docs/testing.md) | Checks, the VM harness, the checklist for real hardware |

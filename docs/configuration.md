@@ -1,7 +1,8 @@
 # Configuration
 
 All settings live in `/boot/firmware/tvlink.conf`, on the SD card's boot partition (the drive called `bootfs` on any
-PC). Change them with `tvlink set`, which checks each value, writes the file safely and restarts what uses it:
+PC). Change them in the console's Settings and Wi-Fi pages ([console](console.md)) or with `tvlink set`, which checks
+each value, writes the file safely and restarts what uses it:
 
 ```bash
 sudo tvlink set POWER_MODE=motion IDLE_MIN=20
