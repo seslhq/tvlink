@@ -102,6 +102,6 @@ or after a change that touches them, check on the bench with a fresh card and re
   goes away.
 - With a keyboard: F12, Ctrl+Shift+I, Ctrl+O and Ctrl+S do nothing useful.
 - `tvlink screenshot` matches the TV; `identify` and `reload` work; `tvlink update` refuses a wrong checksum and
-  installs a good release.
+  installs a good commit.
 
 Reports from your own hardware are welcome as issues: the Pi model, the TV model, and which of these passed.

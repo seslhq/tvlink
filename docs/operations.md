@@ -14,7 +14,7 @@ Organisations past a handful of units. Any other remote shell works too; tvlink 
 | `sudo tvlink screenshot` | Saves what the TV shows to `/run/tvlink/screen.jpg` |
 | `sudo tvlink identify` | Puts the unit's name and IP across the screen for up to 60 s |
 | `sudo tvlink reload` | Reloads the page |
-| `sudo tvlink update URL SHA256` | Installs a release tarball (below) |
+| `sudo tvlink update URL SHA256` | Installs a commit of `main` (below) |
 
 - Screenshot off the unit: `scp` if SSH is on. In a Connect shell, run `base64 /run/tvlink/screen.jpg`, copy all of
   its output, then on your computer run `base64 -d >screen.jpg`, paste and press Ctrl-D (on a Mac:
@@ -45,14 +45,16 @@ scp -r tvlink <user>@tv-lobby-01.local:
 ssh -t <user>@tv-lobby-01.local sudo ./tvlink/install.sh
 ```
 
-Or, from a remote shell with no copy step, install a release by its URL and SHA-256:
+There are no releases: `main` is always the version to install, and CI checks every change to it. From a remote
+shell with no copy step, install a commit of `main` by its archive URL and SHA-256, so every unit gets exactly the
+same code (get the hash on your computer with `curl -sL <url> | shasum -a 256`):
 
 ```bash
-sudo tvlink update https://github.com/seslhq/tvlink/releases/download/v0.1.0/tvlink-0.1.0.tar.gz <sha256>
+sudo tvlink update https://github.com/seslhq/tvlink/archive/<commit>.tar.gz <sha256>
 ```
 
-It refuses a wrong checksum, then runs the release's install.sh as its own unit, so a dropped session can't stop it
-halfway: `journalctl -u tvlink-update -f`. `tvlink show` prints the installed `VERSION`.
+It refuses a wrong checksum, then runs that commit's install.sh as its own unit, so a dropped session can't stop it
+halfway: `journalctl -u tvlink-update -f`.
 
 ## Troubleshooting
 
