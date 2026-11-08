@@ -57,11 +57,13 @@ badge state in over the DevTools pipe instead.
   skipped for up to a week while a configured page is down, so an outage keeps the last good screen.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the
   rest weekly on `UPDATE_DAY`, so a bad package can be held before it reaches everyone.
-- **Cards last.** Chromium's profile lives in RAM (and its component downloads are off, so `/run` never fills), the
-  journal is volatile, and boot-partition writes are rare and atomic.
+- **Cards last.** The kiosk session's `HOME` is the service's runtime dir in RAM, emptied at every start: Chromium's
+  profile and crash reports, NSS and Mesa's shader cache (capped at 16 MB) all land there. Component downloads are
+  off, so `/run` never fills. The journal is volatile, and boot-partition writes are rare and atomic.
 - **The kiosk user is boxed in.** The browser runs as `kiosk`: the render group only, no polkit rights, no cron, a
-  managed policy blocking DevTools, browser pages, file dialogs and downloads. Root hands it requests through files
-  in `/run/tvlink`, without a controlling terminal.
+  home owned by root that it can't write (so nothing it plants runs later: user units, Python's user site,
+  autostart), a managed policy blocking DevTools, browser pages, file dialogs and downloads. Root hands it requests
+  through files in `/run/tvlink`, without a controlling terminal.
 - **Watchdog and Wi-Fi.** systemd's hardware watchdog reboots a hung kernel; Wi-Fi power save is off.
 - **Remote access is not tvlink's job.** Raspberry Pi Connect (or any shell) reaches the CLI; tvlink opens no port.
 

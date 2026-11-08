@@ -55,7 +55,8 @@ tests/vm.sh
 - Wi-Fi join, Wi-Fi country, a rerun that leaves the link up, power save, fallback to the hidden WPA network, and the
   Ethernet-out network check;
 - the splash handing over to the board, the live badge, and a screenshot;
-- the kiosk user's limits: the render group only, and no polkit rights.
+- the kiosk user's limits: the render group only, no polkit rights, and a home it can't write;
+- nothing written to the kiosk's home, and `/run/tvlink` staying small.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
@@ -94,7 +95,7 @@ or after a change that touches them, check on the bench with a fresh card and re
 - The nightly reboot runs with the page up, folder-only and blank; it is skipped while a configured page is down.
 - A 1080p30 H.264 MP4 plays smoothly for an hour; an `index.html`; the broken-files message.
 - A 72 h soak on 1 GB with a real page: lowest available memory, zram use, OOM kills, temperature,
-  `vcgencmd get_throttled`.
+  `vcgencmd get_throttled`; `/home/kiosk` still empty and `du -sh /run/tvlink` small (the GPU's shader cache).
 - Connect survives a reboot and a power cut; `wdctl` shows the watchdog; Wi-Fi power save is off.
 - Motion: a PIR wakes the TV outside on-hours and standby follows after `IDLE_MIN`; `manual+motion` wakes on arrival
   and leaves a TV switched off by hand alone.

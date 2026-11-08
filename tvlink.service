@@ -18,6 +18,9 @@ StandardError=journal
 UtmpIdentifier=tty1
 UtmpMode=user
 RuntimeDirectory=tvlink
+# The session's home is in RAM: /home/kiosk is root's and read-only, so nothing lands on the card and the browser can
+# plant nothing that runs later. Mesa's shader cache is capped, so /run (10% of RAM) can't fill.
+Environment=HOME=/run/tvlink MESA_SHADER_CACHE_MAX_SIZE=16M
 ExecStart=/usr/local/bin/tvlink kiosk
 Restart=always
 RestartSec=5

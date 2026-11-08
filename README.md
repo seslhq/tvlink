@@ -71,7 +71,7 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC), Wi-Fi and the
-motion sensor, and runs 29 checks against the real services: [docs/testing.md](docs/testing.md).
+motion sensor, and runs 32 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 

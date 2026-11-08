@@ -26,7 +26,11 @@ EOF
 # use polkit actions (power off, network settings) or cron.
 ! id -nG kiosk 2>/dev/null | grep -qwE 'sudo|adm' ||
   { echo "User kiosk is an admin: image the Pi with another user name" >&2; exit 1; }
-id kiosk >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin kiosk
+id kiosk >/dev/null 2>&1 || useradd -M -d /home/kiosk -s /usr/sbin/nologin kiosk
+# Its home is root's and empty, so it can plant nothing that runs later (user units, Python user site, autostart);
+# the session's HOME is /run/tvlink (tvlink.service). An older kiosk-owned home goes (rm doesn't follow its links).
+[ "$(stat -c %U /home/kiosk 2>/dev/null)" = root ] || rm -rf /home/kiosk
+install -d -o root -g root -m 755 /home/kiosk
 usermod -G render kiosk
 mkdir -p /etc/polkit-1/rules.d
 printf 'polkit.addRule(function (a, s) { if (s.user == "kiosk") return polkit.Result.NO; });\n' \

@@ -122,6 +122,10 @@ cage=$(pgrep -u kiosk -o -x cage)
 check "kiosk runs with only the render group" grep -qE '^Groups:\s+[0-9]+ [0-9]+ ?$' "/proc/$cage/status"
 check "kiosk can't power off the Pi (polkit)" quiet test "$(pkcheck --action-id org.freedesktop.login1.power-off \
   --process "$cage" >/dev/null 2>&1; echo $?)" != 0
+check "kiosk can't plant a user unit in its home" quiet test "$(runuser -u kiosk -- \
+  mkdir -p /home/kiosk/.config/systemd/user >/dev/null 2>&1; echo $?)" != 0
+check "the session wrote nothing to the kiosk's home" test -z "$(ls -A /home/kiosk)"
+check "/run/tvlink stays under 40 MB" test "$(du -sm /run/tvlink | cut -f1)" -lt 40
 
 echo "== $fails failed"
 [ "$fails" = 0 ]
