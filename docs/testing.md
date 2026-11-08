@@ -12,8 +12,8 @@ python3 tvlink-power test
 python3 tvlink-agent test
 ```
 
-The self-tests cover the settings parser (through `tvlink show`), the power modes, presence and clock logic, and the
-badge.
+The self-tests cover the settings parser (through `tvlink show`), the power modes, presence and clock logic (including
+clock changes), and the badge.
 
 ## The VM
 

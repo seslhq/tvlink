@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 
 CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
 MODES = ("always", "schedule", "motion", "manual", "manual+motion")
@@ -52,9 +52,12 @@ def hhmm(value):
 
 
 def in_hours(now, on, off):
-    """From on to off, local time; off earlier than on wraps past midnight."""
-    t = now.time()
-    return on <= t < off if on <= off else t >= on or t < off
+    """From on to off, local time; off earlier than on wraps past midnight. now: naive local, with fold as
+    datetime.now() sets it. Compared as instants, not wall time: the latest TV_ON or TV_OFF passed (its first pass when
+    clocks go back, so one in the repeated hour acts once; one in a skipped hour acts an hour late)."""
+    ts = now.timestamp()
+    return max((b, is_on) for day in (now.date(), now.date() - timedelta(1)) for t, is_on in ((on, True), (off, False))
+               if (b := datetime.combine(day, t).timestamp()) <= ts)[1]
 
 
 def want_on(mode, now, on, off, motion_age, idle_s):
@@ -215,6 +218,22 @@ def test():
     six, ten, two = dtime(6), dtime(22), dtime(2)
     assert in_hours(d(6), six, ten) and in_hours(d(21, 59), six, ten) and not in_hours(d(22), six, ten)
     assert in_hours(d(23), ten, two) and in_hours(d(1), ten, two) and not in_hours(d(12), ten, two)  # wraps
+    # Clocks change (Sydney): 03:00 back to 02:00 on 5 Apr, 02:00 on to 03:00 on 4 Oct. Each boundary acts once, as
+    # the main loop sees it minute by minute, in every mode that uses the hours.
+    os.environ["TZ"] = "Australia/Sydney"
+    time.tzset()
+    half2 = dtime(2, 30)
+    assert not in_hours(datetime(2026, 4, 5, 2, 10, fold=1), ten, half2)  # a restart in the repeated hour: still off
+    assert in_hours(datetime(2026, 4, 5, 2, 10, fold=1), half2, ten)
+    for day in (datetime(2026, 4, 5), datetime(2026, 10, 4)):
+        for on, off, n in ((ten, half2, 1), (half2, ten, 1), (dtime(2), dtime(2, 59), 2)):
+            for mode in ("schedule", "motion"):
+                prev, acts = None, []
+                for ts in range(int(day.timestamp()), int(day.timestamp()) + 6 * 3600, 60):
+                    want = want_on(mode, datetime.fromtimestamp(ts), on, off, None, 900)
+                    acts += [step(want, prev, False)] if prev is not None and want != prev else []
+                    prev = want
+                assert len(acts) == n, (day, on, off, mode, acts)
     night = d(3)
     assert want_on("always", night, six, ten, None, 900)
     assert not want_on("schedule", night, six, ten, 10, 900)

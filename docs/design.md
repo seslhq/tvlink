@@ -49,7 +49,8 @@ badge state in over the DevTools pipe instead.
   rename and flush again, so a power cut leaves the old file or the new one. It lives on the FAT boot partition so
   any PC can edit it.
 - **Clock trust.** On-hours run only once NTP has synced this boot or the RTC holds a sane date; until then the TV
-  stays on. Motion timing uses the monotonic clock.
+  stays on. Motion timing uses the monotonic clock. On-hours compare instants, not wall time, so a `TV_ON` or
+  `TV_OFF` in the hour repeated when clocks go back acts once.
 - **TV power.** CEC only, through `cec-ctl`, by one process. A TV that drops hotplug in standby is woken from the
   unregistered address, the only message the kernel still lets through.
 - **Nightly reboot as the backstop.** At 03:30, never in the first hour after boot, never while an upgrade runs, and
