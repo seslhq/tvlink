@@ -1,0 +1,99 @@
+<p align="center">
+  <img src="docs/brand/hero.svg" alt="tvlink: a Raspberry Pi 5 connected over HDMI to a TV that shows a web dashboard
+    full screen, with a small green live badge in the corner showing when the board last answered.">
+</p>
+
+# tvlink
+
+Set-and-forget digital signage for consumer TVs. A Raspberry Pi 5 shows one web page, dashboard or folder of images
+and videos full screen on a TV, turns the TV on and off over HDMI-CEC, and keeps going through power cuts, network
+drops and browser crashes without a site visit.
+
+![A dashboard full screen on the TV, with the live badge in the bottom-right corner](docs/images/board.jpg)
+
+## What it does
+
+- **Any URL, full screen.** Chromium in kiosk mode on a Pi 5. The page refreshes itself, so it works with any
+  dashboard; for example SES LHQ TV links, which it was first built for.
+- **An honest screen.** A small badge says whether what is on screen is live, or how old it is. A crashed, frozen or
+  error page goes back to the splash and returns by itself; the TV never shows a browser error.
+
+  ![The badge: live, cached after a server error, offline](docs/images/badges.png)
+
+- **A splash that explains itself.** Until the page answers, the TV says what it is waiting for, with the device's
+  name and IP for whoever is fixing it.
+
+  <p><img src="docs/images/splash-setup.png" width="49%" alt="Splash: Ready to Set Up">
+  <img src="docs/images/splash-waiting.png" width="49%" alt="Splash: Can't Reach the Board"></p>
+
+- **Local content.** Images, videos or an `index.html` on the SD card play with no network, as a fallback or on
+  their own.
+- **TV power over HDMI-CEC.** Always on, on-hours, a motion sensor, the TV remote, or the remote plus motion wake.
+- **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
+  and security updates staged so a few units take them first.
+- **Managed remotely.** One text file on the SD card holds the settings, editable on any PC or with `tvlink set`
+  over Raspberry Pi Connect or SSH. `tvlink doctor` shows the unit's health; `tvlink screenshot` shows the screen.
+
+## How it works
+
+```
+TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
+                         tvlink.service        cage + Chromium on tty1: splash until the page answers, then the page;
+                                               tvlink-agent drives Chromium over a DevTools pipe (badge, recovery)
+                         tvlink-power.service  TV power over CEC: schedule, motion sensor, power-cut wake
+                         tvlink-net.service    Wi-Fi networks from the settings file
+                         tvlink-reboot.timer   nightly reboot, gated on the page answering
+                         /boot/firmware        tvlink.conf and the local content folder (FAT: any PC can edit it)
+```
+
+Bash, Python 3 and systemd; no build step, no containers, nothing listening on the network. The
+design and the reasons behind it: [docs/design.md](docs/design.md).
+
+## Quick start
+
+You need a Raspberry Pi 5 (1 GB is enough) with the official 27 W power supply and Active Cooler, a high-endurance
+microSD card, a micro-HDMI cable, and a TV with HDMI-CEC turned on.
+
+1. Write Raspberry Pi OS Lite (64-bit, Trixie) with Raspberry Pi Imager; set the hostname, a user, SSH with a key,
+   and Wi-Fi if there is no Ethernet.
+2. Copy tvlink to the Pi and install it:
+
+   ```bash
+   git clone https://github.com/seslhq/tvlink
+   scp -r tvlink <user>@tv-lobby-01.local:
+   ssh -t <user>@tv-lobby-01.local sudo ./tvlink/install.sh
+   ```
+
+3. Point it at a page, then reboot: `sudo tvlink set BOARD_URL=https://dashboard.example.com/board`.
+
+The full guide, including TV settings and the CEC test: [docs/setup.md](docs/setup.md).
+
+## Try it without a Pi
+
+On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC), Wi-Fi and the
+motion sensor, and runs 29 checks against the real services: [docs/testing.md](docs/testing.md).
+
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor |
+| [Configuration](docs/configuration.md) | Every setting, power modes, local content |
+| [Operations](docs/operations.md) | Remote management, updates, troubleshooting, on-site notes, replacing a unit |
+| [Design](docs/design.md) | How the parts fit, the decisions behind them, platform facts |
+| [Testing](docs/testing.md) | Checks, the VM harness, the checklist for real hardware |
+| [Brand](docs/brand.md) | Logo, colours and the trademark policy |
+
+## Status
+
+Tested in CI and in the Linux VM. Not yet proven on a Pi with real TVs: the hardware checklist in
+[docs/testing.md](docs/testing.md) is the next step, and reports from your own hardware are welcome.
+
+## Contributing and licence
+
+Pull requests and hardware reports welcome: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
+[SECURITY.md](SECURITY.md).
+
+[Apache-2.0](LICENSE). Copies and forks keep [NOTICE](NOTICE) and the file headers, which point back to this repo.
+The licence grants no rights to the tvlink name or logo: a fork that is passed on is renamed and drops the logo
+([docs/brand.md](docs/brand.md)).
