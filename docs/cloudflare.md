@@ -6,7 +6,7 @@ on a hostname of yours, and Cloudflare Access decides who gets as far as the con
 account and a domain on Cloudflare are enough.
 
 ```
-browser or fleet console ── HTTPS ── Cloudflare, Access ── tunnel ── cloudflared on the unit ── localhost:80
+browser or fleet ── HTTPS ── Cloudflare, Access ── tunnel ── cloudflared on the unit ── localhost:80
 ```
 
 The examples use `example.com` and a unit called `tv-lobby-01`.
@@ -92,6 +92,3 @@ The fleet console runs on a server of your own on `127.0.0.1:8080` ([fleet](flee
    ```
 
 3. An Access application for `tvlink.example.com` with an Allow policy for the people who manage the fleet only.
-
-SES LHQ's own deployment is the example: its fleet console is `tvlink.seslhq.com`, and each unit has its own tunnel
-at a first-level hostname such as `tv-lobby-01.seslhq.com`, all behind Access.

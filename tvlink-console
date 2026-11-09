@@ -1264,7 +1264,8 @@ class Handler(BaseHTTPRequestHandler):
             rows = [("TV", e(str(last.get("tv", "")).capitalize() or "Unknown")),
                     ("Last Seen", ago(seen["time"]) if seen else "Not since the fleet started"),
                     ("Version", e(str(last.get("version") or "Unknown")))]
-            cards.append(f'<a class="card{" stale" if s is None else ""}" href="/u/{e(name)}/">{shot}<strong>{e(name)}</strong>'
+            cards.append(f'<a class="card{" stale" if s is None else ""}" href="/u/{e(name)}/">{shot}'
+                         f'<strong>{e(name)}</strong>'
                          f'<span class="pill {level}">{e(label)}</span>'
                          + (f'<p class="hint">{e(err)}</p>' if err else "")
                          + "<dl>" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows) + "</dl></a>")

@@ -18,22 +18,25 @@ infrared discrete codes nor the HDMI signal.
 
 | Part | Runs as | Does |
 | --- | --- | --- |
-| `tvlink` | root or kiosk | The CLI, the settings parser and the kiosk launcher. `tvlink kiosk` starts the status loop and cage. |
+| `tvlink` | root or kiosk | The CLI, the settings parser and the kiosk launcher |
+| `tvlink kiosk` (`tvlink.service`) | kiosk | Starts the status loop and cage with Chromium on tty1 |
 | status loop (in `tvlink kiosk`) | kiosk | Probes the page (HTTP below 500 counts as up), scans the local folder, and writes `/run/tvlink/status.js` |
 | `splash.html` | Chromium | Shows what the loop reports, plays local content, and hands over to the page once it answers |
-| `tvlink-agent` | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, takes requests (screenshot, identify, reload) |
-| `tvlink-power` | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, overrides (`tvlink override`), clock trust, power-cut handling |
-| `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
-| `tvlink-hotspot` | root | Optional: a NetworkManager hotspot on `wlan0` after `HOTSPOT_MIN` minutes with no network |
-| `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
+| `tvlink-agent` (in `tvlink.service`) | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, switches page links, takes requests (screenshot, identify, reload, HDMI signal) |
+| `tvlink-power` (`tvlink-power.service`) | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, overrides, clock trust, power-cut handling |
+| `tvlink net` (`tvlink-net.service`) | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
+| `tvlink-console` (`tvlink-console.service`) | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
+| `tvlink-hotspot` (`tvlink-hotspot.service`) | root | Optional: a NetworkManager hotspot on `wlan0` after `HOTSPOT_MIN` minutes with no network |
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
-| `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
-| `tvlink-content` | root, no capabilities | Optional: syncs the files `CONTENT_URL`'s manifest lists to `/var/lib/tvlink/content` |
+| `tvlink-content` (`tvlink-content.service`) | root, no capabilities | Optional: syncs the files `CONTENT_URL`'s manifest lists to `/var/lib/tvlink/content` |
 | `tvlink usb` (`tvlink-usb@.service`, from a udev rule) | root | Optional: mounts a USB stick with a `tvlink` folder read-only at `/run/tvlink-usb` |
 | `tvlink lastgood` (`tvlink-lastgood.timer`) | root | Optional: copies the kiosk's last live screenshot to the card, hourly |
-| `tvlink check` | root | Gate for the nightly reboot timer |
+| `tvlink check` (`tvlink-reboot.timer`) | root | Gate for the nightly reboot at 03:30 |
 | `tvlink boot` | root | Writes `cmdline.txt` and `config.txt` from the settings; run by install.sh, `tvlink set` and `tvlink edid` |
+| `tvlink update` (`tvlink-update`, a transient unit) | root | Downloads a commit's archive, checks its SHA-256 and runs its install.sh |
+| `tvlink-console --fleet` (`tvlink-fleet.service`) | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
+| `get.sh` | root | The one-line installer: downloads an archive of the repo over HTTPS, unpacks it whole, runs its install.sh |
 
 One prober feeds everyone: the splash reads `status.js` as JSONP from `file://`, and the agent reads the same file for
 the badge. The page never calls the Pi (Chrome's Local Network Access rules would block it); the agent pushes the
@@ -135,6 +138,12 @@ badge state in over the DevTools pipe instead.
   to the FAT partition any PC reads, and the overlay is meant for units that are set up and left alone. What is
   written while it is on lasts until the next reboot, and the commands that write it say so; content sync pauses, as
   a new set would sit in RAM.
+- **A one-line installer, not an image.** A unit is stock Raspberry Pi OS plus `get.sh`, which fetches an archive of
+  the repo over HTTPS only (redirects included) and runs its install.sh; the same line updates it. The script is one
+  function called on its last line, so a download cut short runs nothing; the archive is unpacked whole into a
+  root-only temporary folder before anything is installed, and install.sh is safe to rerun. HTTPS from GitHub is the
+  trust, as for `git clone`; `tvlink update` takes a SHA-256 where every unit must get the same bytes. The VM test
+  points it at its own https server through `TVLINK_ARCHIVE`, which takes https links only.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the
   rest weekly on `UPDATE_DAY`, so a bad package can be held before it reaches everyone.
 - **Cards last.** The kiosk session's `HOME` is the service's runtime dir in RAM, emptied at every start: Chromium's
@@ -167,11 +176,12 @@ badge state in over the DevTools pipe instead.
 - **Privilege model.** The console runs as `tvlink-console` in a systemd sandbox (read-only system, private `/tmp`, no
   home directories, other users' processes hidden). Root is reachable only through `/etc/sudoers.d/tvlink-console`: an
   exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set`, `update`, `override` and
-  `overlay`, which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
-  process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run` when sudo starts it for
-  the console: its commands then run as from a root shell. sudo does not log these commands, since `tvlink set` can
-  carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from
-  parsing human output; the settings form is built from `tvlink keys --json`, so a new key shows up by itself.
+  `overlay`, which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the
+  settings that imply it. A process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run`
+  when sudo starts it for the console: its commands then run as from a root shell. sudo does not log these commands,
+  since `tvlink set` can carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep
+  the console from parsing human output; the settings form is built from `tvlink keys --json`, so a new key shows up by
+  itself.
 - **Tunnel: Cloudflare, one per unit, opt-in.** `TUNNEL_TOKEN` is the only setting: a unit without it has no
   cloudflared and no extra apt repo, so behaviour is unchanged. Setting it installs cloudflared from Cloudflare's own
   apt repo on demand (not in install.sh: most units never need it, and the token is set after install anyway), and

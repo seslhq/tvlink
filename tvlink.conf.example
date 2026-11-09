@@ -76,6 +76,9 @@ WIFI2_PSK=
 HOTSPOT=0
 HOTSPOT_MIN=5
 
+# TUNNEL_TOKEN, a Cloudflare Tunnel to the console (docs/cloudflare.md), is never read from this file: set it with
+# sudo tvlink set TUNNEL_TOKEN=... or in the console, which keep it root-only on the unit.
+
 # Blank: install upgrades every night (canary units). Mon, Tue, Wed, Thu, Fri, Sat or Sun, spelled exactly so: weekly,
 # days after the canaries; anything else counts as blank. Edit here, then rerun install.sh: tvlink set and a reboot
 # do not apply it.

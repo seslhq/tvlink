@@ -43,8 +43,8 @@ keeps the current one, and Clear removes it.
 - **Privileges.** The console runs as its own system user, `tvlink-console`, in a systemd sandbox (read-only system,
   private `/tmp`, no home directories), with only the capability to bind port 80. It reaches root through sudo, for a
   fixed list of `tvlink` commands in `/etc/sudoers.d/tvlink-console` (`status`, `doctor`, `on`, `off`, `identify`,
-  `reload`, `screenshot`, `reboot`, `logs`, `set`, `update`, `override`, `overlay`). Arguments go to sudo as a list, never through a shell,
-  and sudo does not log them (`set` can carry a Wi-Fi password).
+  `reload`, `screenshot`, `reboot`, `logs`, `set`, `update`, `override`, `overlay`). Arguments go to sudo as a list,
+  never through a shell, and sudo does not log them (`set` can carry a Wi-Fi password).
 - **Login.** One password per unit, stored as a PBKDF2-SHA256 hash (600,000 rounds) readable only by the console user.
   Sessions are in memory (a restart logs everyone out) and expire after 12 hours. The cookie is `HttpOnly` and
   `SameSite=Strict`, and `Secure` when the request came through an HTTPS tunnel or proxy (`Cf-Visitor` says

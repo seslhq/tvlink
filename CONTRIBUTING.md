@@ -15,7 +15,7 @@ python3 tvlink-content test
 python3 tvlink-hotspot test
 ```
 
-A change to install.sh, the units, TV power, HDMI, Wi-Fi, the kiosk or the console also needs `tests/vm.sh`
+A change to install.sh, get.sh, the units, TV power, HDMI, Wi-Fi, the kiosk or the console also needs `tests/vm.sh`
 ([docs/testing.md](docs/testing.md)). It runs on an Apple silicon Mac only: if you can't run it, say so in the pull
 request and the maintainer will.
 

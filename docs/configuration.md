@@ -11,9 +11,9 @@ sudo tvlink set BOARD_URL=https://dashboard.example.com/board
 tvlink show
 ```
 
-After a hand edit, reboot or run `sudo systemctl restart tvlink tvlink-power tvlink-net`. Put notes on their own
-line starting with `#`; quote values with spaces or `#`. `tvlink show` prints what tvlink actually reads, with
-passwords and the tunnel token masked. The file is only ever read, never run, and a bad value falls back to its default.
+After a hand edit, reboot to apply it. Put notes on their own line starting with `#`; quote values with spaces or
+`#`. `tvlink show` prints what tvlink actually reads, with passwords and the tunnel token masked. The file is only
+ever read, never run, and a bad value falls back to its default.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -151,7 +151,7 @@ back on its own is joined again. A unit with no network at all keeps falling bac
 ## Local content
 
 Put files in the `tvlink` folder on the boot partition (`/boot/firmware/tvlink/` on the Pi). New files show within
-90 s.
+a few seconds.
 
 - Images (`jpg`, `png`, `webp`, `gif`, `svg`) show for `SLIDE_SECONDS` each; `name.30s.jpg` sets its own time. Size
   them to 1920x1080.
@@ -184,8 +184,10 @@ than listed or does not match its checksum, more than 1 GiB in all) keeps the se
 
 ```json
 {"files": [
-  {"name": "01-welcome.png", "url": "01-welcome.png", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "size": 48213},
-  {"name": "02-safety.mp4", "url": "https://cdn.example.com/safety-v3.mp4", "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752", "size": 7340032}
+  {"name": "01-welcome.png", "url": "01-welcome.png", "size": 48213,
+   "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+  {"name": "02-safety.mp4", "url": "https://cdn.example.com/safety-v3.mp4", "size": 7340032,
+   "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"}
 ]}
 ```
 
@@ -193,11 +195,10 @@ than listed or does not match its checksum, more than 1 GiB in all) keeps the se
 - `url`: relative to the manifest or an absolute https link (redirects only to https); left out, it is the name.
 - `sha256` and `size` (bytes): a file is used only if both match.
 
-Make one for a folder and serve both side by side on any https host: `tvlink content manifest DIR >DIR/manifest.json`
-on a unit, or `./tvlink-content manifest DIR` from a checkout on any machine with Python 3 (the folder's playable
-files, by name). `sudo tvlink content sync` syncs now and prints
-the result, `tvlink content status` the last one; the console's Status page shows it too. Clearing `CONTENT_URL`
-removes the synced files.
+Make one for a folder and serve both side by side on any https host: `tvlink content manifest DIR >DIR/manifest.json` on
+a unit, or `./tvlink-content manifest DIR` from a checkout on any machine with Python 3 (the folder's playable files, by
+name). `sudo tvlink content sync` syncs now and prints the result, `tvlink content status` the last one; the console's
+Status page shows it too. Clearing `CONTENT_URL` removes the synced files.
 
 ## The screen
 

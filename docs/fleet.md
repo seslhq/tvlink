@@ -5,7 +5,7 @@ place: the same console code in fleet mode (`tvlink-console --fleet`), on any Li
 Pi needed. It holds a list of units and reaches each through its console's API, with the unit's API token and, behind
 Cloudflare Access, a service token.
 
-![The fleet overview: four units with their screenshots, badges, TV state, last seen and version](images/fleet-overview.png)
+![The fleet overview: each unit's screen, badge, TV state, last seen and version](images/fleet-overview.png)
 
 ## Pages
 
