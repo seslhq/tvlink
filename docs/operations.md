@@ -55,16 +55,16 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 Debian and Raspberry Pi security updates install at 02:30 (every night on canary units, weekly on `UPDATE_DAY` on
 the rest) and the 03:30 reboot loads them. Hold a bad package everywhere with `sudo apt-mark hold <package>`.
 
-To update tvlink itself, copy the new folder and rerun the installer, which restarts the services (reboot only if it
-says `Reboot to apply`):
+There are no releases: `main` is always the version to install, and CI checks every change to it. To update tvlink
+itself, install it again the way it was installed ([setup](setup.md#provisioning-a-unit)): the one-line installer on
+the unit, or a new copy of the folder and its install.sh. Either restarts the services; reboot only if it says
+`Reboot to apply`.
 
 ```bash
-scp -r tvlink <user>@tv-lobby-01.local:
-ssh -t <user>@tv-lobby-01.local sudo ./tvlink/install.sh
+curl -fsSL https://raw.githubusercontent.com/seslhq/tvlink/main/get.sh | sudo bash
 ```
 
-There are no releases: `main` is always the version to install, and CI checks every change to it. From the console's
-Update page or a remote shell, with no copy step, install a commit of `main` by its archive URL and SHA-256, so every
+From the console's Update page or a remote shell, install a commit of `main` by its archive URL and SHA-256, so every
 unit gets exactly the same code (get the hash on your computer with `curl -sL <url> | shasum -a 256`):
 
 ```bash

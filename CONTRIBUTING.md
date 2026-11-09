@@ -7,7 +7,7 @@ non-goals in [docs/design.md](docs/design.md).
 Before a pull request, run (with shellcheck installed):
 
 ```bash
-shellcheck tvlink install.sh tests/*.sh
+shellcheck tvlink install.sh get.sh tests/*.sh
 python3 tvlink-power test
 python3 tvlink-agent test
 python3 tvlink-console test

@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - run: shellcheck tvlink install.sh tests/*.sh
+      - run: shellcheck tvlink install.sh get.sh tests/*.sh
       - run: python3 tvlink-power test
       - run: python3 tvlink-agent test
       - run: python3 tvlink-console test

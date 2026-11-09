@@ -32,6 +32,7 @@ check "tvlink-power test" quiet python3 tvlink-power test
 check "tvlink-agent test" quiet python3 tvlink-agent test
 check "tvlink-console test" quiet python3 tvlink-console test
 check "tvlink-content test" quiet python3 tvlink-content test
+check "tvlink-hotspot test" quiet python3 tvlink-hotspot test
 # Settings the checks change, as an earlier run that stopped midway may have left them
 modprobe -r g_mass_storage 2>/dev/null
 tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned HDMI_FORCE_HOTPLUG=0 SOURCE=auto USB_CONTENT=0 \
@@ -625,6 +626,54 @@ check "... the page comes back" within 60 shows "$board"
 command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf
 systemctl daemon-reload
 tvlink set BROWSER_RESTART= >/dev/null
+
+echo "== One-line installer (get.sh, its archives from the content server's https stand-in)"
+# GitHub-style archives of this checkout (one top folder) at https://127.0.0.1:8443/archive/<ref>.tar.gz; the commit's
+# says its version is -get, so the check sees which one installed. curl trusts the test's CA through CURL_CA_BUNDLE.
+a=$d/src/archive
+command rm -rf "$a" && mkdir -p "$a/stage" "$a/bare/tvlink-bare"
+tar -C "$PWD/.." -cf - --exclude=.git --exclude=__pycache__ "${PWD##*/}" | tar -C "$a/stage" -xf -
+tar -C "$a/stage" -czf "$a/main.tar.gz" --transform "s,^${PWD##*/},tvlink-main," "${PWD##*/}"
+sed -i 's/^VERSION=\(.*\)/VERSION=\1-get/' "$a/stage/${PWD##*/}/tvlink"
+tar -C "$a/stage" -czf "$a/abc1234.tar.gz" --transform "s,^${PWD##*/},tvlink-abc1234," "${PWD##*/}"
+echo '# not tvlink' >"$a/bare/tvlink-bare/README.md" && tar -C "$a/bare" -czf "$a/bare.tar.gz" tvlink-bare
+cp get.sh "$a/"
+version=$(sed -n 's/^VERSION=//p' tvlink)
+get() { # args...: curl ... | bash -s -- args, as root, against the stand-in; output and errors
+  curl -fsS --cacert "$d/ca.pem" https://127.0.0.1:8443/archive/get.sh |
+    TVLINK_ARCHIVE=${archive:-https://127.0.0.1:8443/archive} CURL_CA_BUNDLE="$d/ca.pem" bash -s -- "$@" 2>&1
+}
+leftover() { compgen -G '/var/tmp/tvlink-get.*' >/dev/null; }
+out=$(curl -fsS --cacert "$d/ca.pem" https://127.0.0.1:8443/archive/get.sh | runuser -u nobody -- bash 2>&1)
+check "not root: refused" says 'Run as root'
+out=$(archive=http://127.0.0.1:8443/archive get); check "a plain http archive link refused" says 'https link'
+out=$(get 'main;id'); check "a bad commit refused" says 'Not a commit'
+printf 'ID=debian\nVERSION_CODENAME=bookworm\n' >"$a/os-release"
+other_os() { # args...: get.sh with another release in /etc/os-release
+  # shellcheck disable=SC2016 # expanded by sh
+  TVLINK_ARCHIVE=https://127.0.0.1:8443/archive CURL_CA_BUNDLE="$d/ca.pem" unshare -m sh -c \
+    'mount --bind "$1" /etc/os-release && shift && exec bash "$@"' _ "$a/os-release" get.sh "$@" 2>&1
+}
+out=$(other_os); check "Debian bookworm refused" says 'not debian bookworm arm64'
+out=$(other_os --force 0000000); check "... --force goes on" says 'Download failed'
+out=$(get 0000000); check "a missing commit: download failed" says 'Download failed'
+check "... nothing left behind" no leftover
+out=$(get bare); check "an archive without install.sh refused" says 'No install.sh in the archive'
+out=$(get abc1234); check "a commit installs" says "^Installed tvlink $version-get"
+check "... that commit's tvlink" grep -qx "VERSION=$version-get" <(tvlink show)
+check "... its temp folder gone" no leftover
+out=$(get); check "rerun with main: an update" says "^Installed tvlink ${version}[.] "
+check "... main's tvlink" grep -qx "VERSION=$version" <(tvlink show)
+for u in tvlink tvlink-power tvlink-net tvlink-console; do
+  check "... $u running" within 10 systemctl -q is-active "$u"
+done
+command rm -rf "$a"
+# The install restarted the console, which keeps sessions in memory: log in again
+command rm -f "$c/jar"
+login_page() { [ "$(web /login)" = 200 ]; }
+check "... the console back" within 20 login_page
+check "... log in again" test "$(web -d "csrf=$(csrf)" -d password=vm-test-password /login)" = 303
+web / >/dev/null && t=$(csrf)
 
 echo "== Read-only root (raspi-config; the overlay boot simulated in a chroot)"
 # As on Pi OS: the real raspi-config, from the Raspberry Pi repo (the script alone: its nonint calls need nothing else)

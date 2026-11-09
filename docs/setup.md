@@ -26,7 +26,16 @@ Image every unit fresh; never clone a configured card (clones share SSH host key
    - the time zone of the site (on-hours use Pi local time);
    - Wi-Fi if there is no Ethernet;
    - SSH with public-key authentication only.
-2. Boot the Pi with a TV attached, copy tvlink to it and install (`<user>` is the Imager user):
+2. Boot the Pi with a TV attached and install tvlink from a shell on it (eg `ssh <user>@tv-lobby-01.local`, `<user>`
+   being the Imager user):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/seslhq/tvlink/main/get.sh | sudo bash
+   ```
+
+   It downloads `main` from GitHub over HTTPS into a temporary folder, unpacks it whole, runs its `install.sh` and
+   cleans up. `... | sudo bash -s -- <commit>` installs a commit (or a branch or tag) instead. Anything but Raspberry
+   Pi OS or Debian Trixie on arm64 is refused unless given `--force`. Or install from a clone on your computer:
 
    ```bash
    git clone https://github.com/seslhq/tvlink

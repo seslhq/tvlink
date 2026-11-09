@@ -7,7 +7,7 @@ Three levels, from seconds to a real TV.
 Run before every change; CI runs the same on every push and pull request:
 
 ```bash
-shellcheck tvlink install.sh tests/*.sh
+shellcheck tvlink install.sh get.sh tests/*.sh
 python3 tvlink-power test
 python3 tvlink-agent test
 python3 tvlink-console test
@@ -63,6 +63,7 @@ tests/vm.sh
 | Cloudflare Tunnel | The real cloudflared from Cloudflare's repo, with a made-up token that Cloudflare refuses (the VM needs internet) | `tvlink set TUNNEL_TOKEN=...` |
 | USB stick | `dummy_hcd` (a virtual USB controller) and `g_mass_storage` serving a partitioned FAT image with a `tvlink` folder: a real USB mass storage device, through usb-storage, udev and systemd as on a Pi | `modprobe g_mass_storage file=/run/tvlink-test-stick.img removable=1 ro=1` (plug in), `modprobe -r g_mass_storage` (pull out) |
 | Content server | Python's https server on 127.0.0.1:8443 with a certificate from its own CA, which tvlink-content trusts through `SSL_CERT_FILE` (a drop-in) | `systemctl stop tvlink-test-content-server` |
+| GitHub, for get.sh | The content server's `/archive`: get.sh and archives of this checkout, through `TVLINK_ARCHIVE` (https only), trusted through `CURL_CA_BUNDLE` | |
 | Time since boot | `TVLINK_UPTIME` (a drop-in for the kiosk) points at a file saying 99999 s, so the browser restart runs however recently the VM started | |
 | Fleet server | The VM itself: `tvlink-fleet.service` on port 8081 (a drop-in), pointed at the unit's console on `http://127.0.0.1` | `curl http://127.0.0.1:8081/...` |
 
@@ -115,6 +116,10 @@ tests/vm.sh
   planted in its place not followed; with the board down after a kiosk restart, the splash shows it full screen with
   the red Offline marker; `LAST_GOOD=0` deletes it;
 - the daily browser restart: a new Chromium at `BROWSER_RESTART` in the same cage, and the page back;
+- the one-line installer, fetched with curl and piped to bash as on a Pi: refused when not root, for an http archive
+  link, a malformed commit, Debian bookworm (`--force` goes on), a missing commit and an archive without install.sh,
+  leaving nothing behind; a commit's archive installs that commit, and a rerun with `main` updates back, with the
+  services running;
 - the read-only root: raspi-config from the Raspberry Pi repo (`raspi-config-core`); `tvlink overlay on` installs
   overlayroot and puts `overlayroot=tmpfs` in `cmdline.txt` once (kept by `tvlink boot`), status says it is on after
   a reboot, the console shows it and offers Turn Off, which the API then does. The VM boots its own kernel command
