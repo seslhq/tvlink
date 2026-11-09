@@ -34,7 +34,8 @@ through power cuts, network drops and browser crashes without a site visit.
   marked Offline, when a unit starts with no network.
 - **TV power three ways.** HDMI-CEC; infrared with built-in discrete codes for common brands or codes learned from
   the TV's remote; or the HDMI signal off and on, for TVs that sleep without one. Always on, on-hours, a motion
-  sensor, the TV remote, or the remote plus motion wake, with any of them.
+  sensor, the TV remote, or the remote plus motion wake, with any of them. An override forces it on or off for a
+  while (4 h, until 07:00) from the console, and ends by itself.
 - **A steady HDMI link.** Optional forced hotplug and a captured EDID, so a TV that is off or on another input at
   boot still gets the right picture.
 - **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
@@ -100,7 +101,7 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi,
-the motion sensor and a USB stick, and runs 205 checks against the real services: [docs/testing.md](docs/testing.md).
+the motion sensor and a USB stick, and runs 232 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 

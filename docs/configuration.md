@@ -77,6 +77,29 @@ Consumer TVs are built for a few hours a day, so pick the least on-time that sui
 - `schedule` and `motion` need different `TV_ON` and `TV_OFF`; otherwise, or with an unknown mode, the Pi uses
   `always` and logs why.
 
+### Overrides
+
+An override forces the TV on or off over the power mode for a while, eg on for an evening event or off while a site
+is closed, from the console's Actions page or a shell:
+
+```bash
+sudo tvlink override on 4h               # d, h and m: 30m, 1h30m, 2d (up to 31d)
+sudo tvlink override off until 07:00     # the next 07:00
+sudo tvlink override on                  # schedule and motion: until the next TV_ON or TV_OFF
+sudo tvlink override                     # what is in force: eg "on until Tue 10 Nov 07:00", or none
+sudo tvlink override clear
+```
+
+- While it lasts the TV is handled as in on-time (on: woken again within 5 min if it goes to standby) or off-hours
+  (off: standby once, then left alone; motion and `manual+motion` wakes wait). It works with every mode and power
+  method except `none`.
+- Without a length it ends at the next `TV_ON` or `TV_OFF`, as a thermostat's hold ends at the next scheduled
+  change; `always`, `manual` and `manual+motion` have no such time, so they need a length or `until`.
+- It ends at a fixed instant, kept in `/var/lib/tvlink/override` (root only): it holds through restarts, reboots and
+  power cuts, and a clock change in between counts real hours. Then the mode takes over again: `schedule` turns the
+  TV on or off as the hours say, `manual` modes leave it as it is.
+- Like on-hours it waits for the clock: until NTP has synced (or the RTC battery holds the time) the TV stays on.
+
 ## Power methods
 
 Every power mode works with every method; only what the Pi can learn about the TV differs.

@@ -2,6 +2,7 @@
 # tvlink: show the splash until the board answers, run it full screen, turn the TV on and off.
 # Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|reboot|update|set KEY=value...|console claim|reset
 #        tvlink ir learn|test on|off, tvlink edid capture|clear, tvlink content sync|status|manifest DIR
+#        tvlink override [on|off [DURATION|until HH:MM]|clear]
 #        (services and the console use check, kiosk, browser, net, mode, keys --json, logs, tunnel, usb, lastgood;
 #        install.sh boot)
 # SPDX-License-Identifier: Apache-2.0
@@ -914,11 +915,16 @@ case $1 in
   content) content_cmd "${2:-}" "${3:-}" ;;
   lastgood) lastgood ;;
   edid) edid "${2:-}" ;;
+  override) # the TV forced on or off over the power mode until a time; tvlink-power keeps the logic and honours it
+    [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink override [on|off [DURATION|until HH:MM]|clear]"
+    shift
+    exec "${0%/*}/tvlink-power" override "$@" ;;
   boot) boot ;;
   reboot) # planned, so POWER_MODE=manual does not wake the TV after it; in 3 s, so the console can answer first
     [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink reboot"
     touch /boot/firmware/.tvlink-planned-reboot
     systemd-run --quiet --collect --on-active=3 /bin/systemctl reboot && echo "Rebooting in 3 s" ;;
   *) die "Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|reboot|update URL SHA256|\
-set KEY=value...|console claim|reset|ir learn|test on|off|edid capture|clear|content sync|status|manifest DIR" ;;
+set KEY=value...|console claim|reset|ir learn|test on|off|edid capture|clear|content sync|status|manifest DIR|\
+override [on|off [DURATION|until HH:MM]|clear]" ;;
 esac

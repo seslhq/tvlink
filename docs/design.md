@@ -22,7 +22,7 @@ infrared discrete codes nor the HDMI signal.
 | status loop (in `tvlink kiosk`) | kiosk | Probes the page (HTTP below 500 counts as up), scans the local folder, and writes `/run/tvlink/status.js` |
 | `splash.html` | Chromium | Shows what the loop reports, plays local content, and hands over to the page once it answers |
 | `tvlink-agent` | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, takes requests (screenshot, identify, reload) |
-| `tvlink-power` | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, clock trust, power-cut handling |
+| `tvlink-power` | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, overrides (`tvlink override`), clock trust, power-cut handling |
 | `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
 | `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
@@ -64,6 +64,14 @@ badge state in over the DevTools pipe instead.
   the unregistered address, the only message the kernel still lets through. The modes need only one thing from a
   method: whether `status` can be believed. `unknown` (IR, or a TV that never answered) means no re-wake checks, so a
   one-way method never loops; `standby` or `off` means wake again in on-time.
+- **Overrides as instants, in tvlink-power.** An override replaces the mode's answer to "should the TV be on" and
+  nothing else, so it reuses on-time and off-hours handling and works with every mode and method; manual modes, which
+  have no answer, get one only while it lasts. Its end is stored as an absolute time (Unix seconds), not wall time, so
+  restarts, reboots, clock changes and NTP jumps all leave it right; it is honoured only once the clock can be
+  trusted. tvlink-power rereads the root-only file every second (cheap, no card writes) instead of being restarted,
+  and its `override` subcommand holds the parsing, so the logic and its self-tests sit in one place. Without a length
+  it ends at the next `TV_ON` or `TV_OFF`, the thermostat's "hold until the next change"; modes without hours need
+  one, rather than a made-up default.
 - **Infrared: discrete codes only, sourced or learned.** A toggle code can't be used without knowing the TV's state,
   which IR can't give, so the built-in table holds only discrete on and off codes with a cited source (IRDB, Tasmota's
   code list), and anything else is learned from the TV's own remote as raw pulses, which works for any protocol.
@@ -133,8 +141,8 @@ badge state in over the DevTools pipe instead.
   listens. Plain HTTP on the LAN; HTTPS is the tunnel's job.
 - **Privilege model.** The console runs as `tvlink-console` in a systemd sandbox (read-only system, private `/tmp`, no
   home directories, other users' processes hidden). Root is reachable only through `/etc/sudoers.d/tvlink-console`: an
-  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set` and `update`, which check every
-  argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
+  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set`, `update` and `override`,
+  which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
   process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run` when sudo starts it for
   the console: its commands then run as from a root shell. sudo does not log these commands, since `tvlink set` can
   carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from

@@ -22,6 +22,8 @@ quiet() { "$@" >/dev/null 2>&1; }
 tv_is() { [ "$(tvlink status)" = "$1" ]; }
 on_wifi() { nmcli -t -f DEVICE,STATE,CONNECTION device | grep -qx "wlan0:connected:$1"; }
 logged() { journalctl -q -t tvlink --since "$since" | grep "$1" >/dev/null; } # kiosk lines come from its login session
+power_said() { journalctl -q -u tvlink-power --since "$since" | grep -q "$1"; }
+hm() { date -d "$1" +%H:%M; } # eg hm '+1 hour'
 
 echo "== Install and self-tests"
 command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf # left by an earlier run
@@ -82,6 +84,48 @@ echo 1 >/run/pir17
 check "motion after the quiet minute wakes the TV" within 15 tv_is on
 echo 0 >/run/pir17
 tvlink set POWER_MODE=schedule IDLE_MIN=15 >/dev/null
+
+echo "== Overrides (schedule, CEC)"
+# A status query while tvlink-power sends can make the send fail (both use the adapter): let it act first
+acted() { sleep 5; }
+tvlink override clear >/dev/null # left by an earlier run
+acted
+tvlink set TV_ON="$(hm '+1 hour')" TV_OFF="$(hm '-1 hour')" >/dev/null # off-hours now
+acted
+check "off-hours: standby" within 20 tv_is standby
+out=$(tvlink override on 1m); check "override on for 1 min: says until when" says '^Override: TV on until '
+acted
+check "... wakes the TV in off-hours" within 15 tv_is on
+check "... tvlink override shows it" grep -q '^on until ' <(tvlink override)
+check "... stored root only" test "$(stat -c '%U %a' /var/lib/tvlink/override)" = "root 600"
+since=$(date '+%F %T')
+systemctl restart tvlink-power
+check "... survives a tvlink-power restart" within 10 power_said 'Override: TV on until'
+acted
+check "... the TV still on" tv_is on
+check "... expires back to standby" within 90 power_said 'Override over: back to POWER_MODE=schedule'
+acted
+check "... standby" within 15 tv_is standby
+check "... and tvlink override says none" test "$(tvlink override)" = none
+tvlink override on 30m >/dev/null
+acted
+check "override on again" within 15 tv_is on
+out=$(tvlink override clear); check "clear" says 'Override cleared'
+acted
+check "... back to standby" within 15 tv_is standby
+tvlink set TV_ON="$(hm '-1 hour')" TV_OFF="$(hm '+1 hour')" >/dev/null # on-hours now
+acted
+check "on-hours: on" within 20 tv_is on
+tvlink override off until "$(hm '+30 min')" >/dev/null
+acted
+check "override off until a time in on-hours: standby" within 15 tv_is standby
+out=$(tvlink override on 4x 2>&1); check "a bad length refused" says 'Give how long'
+tvlink override clear >/dev/null
+acted
+check "... cleared: on again" within 15 tv_is on
+tvlink set POWER_MODE=always >/dev/null
+out=$(tvlink override off 2>&1); check "always: no default end, a length needed" says 'has no on-hours'
+tvlink set POWER_MODE=schedule TV_ON=06:00 TV_OFF=22:00 >/dev/null
 
 echo "== TV power by infrared (rc-loopback for the IR LED, the receiver and the TV)"
 # What is sent on rc-loopback's /dev/lirc0 comes back on it, and the kernel decodes it to scancodes on its input
@@ -248,6 +292,16 @@ check "... and sudo did not log the command" quiet test "$(journalctl -q --since
 check "API refuses a bad value, naming the key" test "$(web -H "X-CSRF-Token: $t" -d '{"OVERLAY_CORNER": "middle"}' \
   /api/settings)/$(field key)" = 400/OVERLAY_CORNER
 check "claimed: the code is gone from the splash" within 60 splash_claim ''
+check "API override on for 30 min" test "$(web -H "X-CSRF-Token: $t" -d '{"override": "on", "for": "30m"}' \
+  /api/override)" = 200
+web /api/status >/dev/null
+check "... the console's Status says until when" grep -q '^on until ' <(field override)
+web /actions >/dev/null
+check "... the Actions page offers Clear Override" grep -q 'value="clear">Clear Override<' "$c/body"
+check "API override: a bad length refused" test "$(web -H "X-CSRF-Token: $t" -d '{"override": "on", "for": "4x"}' \
+  /api/override)" = 400
+check "API override clear" test "$(web -H "X-CSRF-Token: $t" -d '{"override": "clear"}' /api/override)" = 200
+check "... cleared" test "$(tvlink override)" = none
 tvlink set OVERLAY_CORNER=bottom-right >/dev/null
 hdr=(-H 'Cf-Access-Authenticated-User-Email: someone@example.com' -H 'Cf-Access-Jwt-Assertion: x.y.z'
   -H 'X-Forwarded-For: 192.0.2.9' -H 'X-Forwarded-User: admin')
@@ -337,6 +391,10 @@ check "fleet: the unit's Settings page" test "$(fweb /u/vm-unit/settings)" = 200
 check "... a bad value comes back with its error" test "$(fweb -d "csrf=$f" -d OVERLAY_CORNER=middle \
   /u/vm-unit/settings)" = 400
 check "fleet: the unit's Logs page" test "$(fweb /u/vm-unit/logs)" = 200
+check "fleet: an override through it" test "$(fweb -d "csrf=$f" -d override=off -d for=30m /u/vm-unit/actions)" = 303
+check "... set on the unit" grep -q '^off until ' <(tvlink override)
+fweb -d "csrf=$f" -d override=clear /u/vm-unit/actions >/dev/null
+check "... and cleared" test "$(tvlink override)" = none
 rm -f "$c/fjar"
 check "fleet: refused without a login" test "$(fweb /u/vm-unit/)" = 303
 web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-fleet >/dev/null
@@ -348,7 +406,6 @@ enabled() { # outputs cage has on
     grep -c 'Enabled: yes'
 }
 signal_is() { [ "$(enabled)" = "$1" ]; }
-power_said() { journalctl -q -u tvlink-power --since "$since" | grep -q "$1"; }
 since=$(date '+%F %T')
 tvlink set POWER_METHOD=signal POWER_MODE=always >/dev/null
 check "signal: tvlink-power turns it on at start (always)" within 20 power_said 'HDMI signal on'

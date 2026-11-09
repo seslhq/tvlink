@@ -63,6 +63,9 @@ CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I, O, 0 or 1
 STATES = {"ready": "Live", "folder": "Local Content", "setup": "Ready to Set Up", "network": "No Network",
           "waiting": "Can't Reach the Board", "empty": "No Files to Show", "starting": "Starting"}
 SOURCES = {"usb": "USB stick", "synced": "Synced", "card": "SD card"}  # local content, in the order tvlink picks
+# How long an override lasts, for the Actions page's picker; blank: until the next TV On or TV Off
+LENGTHS = (("30m", "30 Min"), ("1h", "1 Hour"), ("2h", "2 Hours"), ("4h", "4 Hours"), ("8h", "8 Hours"),
+           ("12h", "12 Hours"), ("24h", "24 Hours"), ("3d", "3 Days"), ("7d", "7 Days"))
 
 
 # Passwords, tokens and claim codes
@@ -300,6 +303,7 @@ def status(brief=False):
     _, tv, _ = tvlink("status", timeout=30)
     _, tunnel, _ = tvlink("tunnel", root=False, timeout=10)
     _, sync, _ = tvlink("content", "status", root=False, timeout=10)
+    _, held, _ = tvlink("override", timeout=30)
     _, doctor, err = (True, "", "") if brief else tvlink("doctor", timeout=60)
     _, shot = screen()
     label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
@@ -308,7 +312,7 @@ def status(brief=False):
     return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": sch.get("version"),
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
             "tv": tv or "unknown", "method": power_method(sch), "tunnel": tunnel or "unknown", "uptime": uptime(),
-            "content": content_label(s), "sync": sync or "unknown",
+            "content": content_label(s), "sync": sync or "unknown", "override": held or "unknown",
             "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
 
 
@@ -348,6 +352,28 @@ def action(name):
     return ok, out or err or ("Done" if ok else "Failed")
 
 
+def override_args(power, length="", at=""):
+    """tvlink override's arguments: power on, off or clear; for a length (eg 4h) or until a time (HH:MM, which wins);
+    neither: until the next TV On or TV Off. Raises ValueError."""
+    if power not in ("on", "off", "clear"):
+        raise ValueError("override is on, off or clear")
+    if not isinstance(length, str) or not re.fullmatch(r"[0-9dhm]{0,12}", length):
+        raise ValueError("for is a length, eg 4h or 1h30m")
+    if not isinstance(at, str) or not re.fullmatch(r"([0-9]{1,2}:[0-9]{2})?", at):
+        raise ValueError("until is a time, HH:MM")
+    return [power] + ([] if power == "clear" else ["until", at] if at else [length] if length else [])
+
+
+def override(power, length="", at=""):
+    """(ok, message): force the TV on or off for a while, or clear it."""
+    try:
+        args = override_args(power, length, at)
+    except ValueError as err:
+        return False, str(err)
+    ok, out, err = tvlink("override", *args, timeout=60)
+    return ok, out or err or "Failed"
+
+
 def update(url, sha256):
     ok, out, err = tvlink("update", url, sha256, timeout=330)
     return ok, out or err or "Failed"
@@ -355,7 +381,7 @@ def update(url, sha256):
 
 # What the pages show and do, for this unit; in fleet mode a Remote with the same calls, through the unit's API.
 LOCAL = types.SimpleNamespace(status=status, schema=schema, save=save, action=action, screen=screen, logs=logs,
-                              networks=networks, update=update)
+                              networks=networks, update=update, override=override)
 
 
 # Fleet mode: units reached through their API
@@ -480,7 +506,8 @@ class Remote:
             raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
         SEEN[self.name] = {"time": time.time(), "status": s}
         return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
-                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "uptime": 0, "health": [], "screenshot": None,
+                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "override": "unknown", "uptime": 0,
+                "health": [], "screenshot": None,
                 **s}
 
     def schema(self):
@@ -497,6 +524,10 @@ class Remote:
 
     def action(self, name):
         code, r = self.json("POST", "/api/action", {"action": name}, timeout=90)
+        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+
+    def override(self, power, length="", at=""):
+        code, r = self.json("POST", "/api/override", {"override": power, "for": length, "until": at}, timeout=90)
         return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
 
     def update(self, url, sha256):
@@ -559,6 +590,11 @@ def badge(s):
     if state == "folder":
         return "live", "Local Content"
     return "warn", STATES.get(state, state or "Unknown")
+
+
+def cap(text):
+    """First letter up, the rest as it is (str.capitalize lowers it: MB, Tue)."""
+    return text[:1].upper() + text[1:]
 
 
 def ago(t, now=None):
@@ -996,8 +1032,9 @@ class Handler(BaseHTTPRequestHandler):
         taken = time.strftime("Taken %H:%M:%S", time.localtime(s["screenshot"])) if s["screenshot"] else ""
         tv = f'{s["tv"].capitalize()} ({METHODS.get(s.get("method"), METHODS["cec"])[0]})'  # eg Unknown (Infrared)
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
-                ("TV", e(tv)), ("Tunnel", e(s.get("tunnel", "").capitalize())),
-                ("Local Content", e(s.get("content") or "None")), ("Content Sync", e(s.get("sync", "").capitalize())),
+                ("TV", e(tv)), ("Override", e(cap(s.get("override", "")))),
+                ("Tunnel", e(s.get("tunnel", "").capitalize())),
+                ("Local Content", e(s.get("content") or "None")), ("Content Sync", e(cap(s.get("sync", "")))),
                 ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
         body = (f'<div class="grid"><figure>{shot}<figcaption><span>{taken}</span>'
@@ -1048,6 +1085,9 @@ class Handler(BaseHTTPRequestHandler):
         self.settings_page(method, form, wifi=True)
 
     def actions_page(self, method, form):
+        if method == "POST" and "override" in form:
+            ok, msg = self.unit.override(form["override"], form.get("for", ""), form.get("until", ""))
+            return self.flash_back(self.base + "/actions", msg, not ok)
         if method == "POST":
             action, back = form.get("action", ""), form.get("back")
             back = back if back in (self.base + "/", self.base + "/actions") else self.base + "/actions"
@@ -1056,7 +1096,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = self.unit.action(action)
             return self.flash_back(back, msg, not ok)
         flash, bad = self.take_flash()
-        _, on, off = METHODS.get(power_method(self.unit.schema()), METHODS["cec"])
+        sch = self.unit.schema()
+        _, on, off = METHODS.get(power_method(sch), METHODS["cec"])
         cards = [("reload", "Reload Page", "Reloads the page on the TV."),
                  ("identify", "Identify", "The unit's name and IP across the TV for up to a minute."),
                  ("screenshot", "Take Screenshot", "What the TV shows now, on the Status page."),
@@ -1071,7 +1112,25 @@ class Handler(BaseHTTPRequestHandler):
                  f'<span>Reboot now?</span>'
                  f'<button class="danger" name="action" value="reboot">Reboot Now</button></form></details></div>'
                  f'</div>')
+        body += self.override_form(sch, self.unit.status(brief=True).get("override", "unknown"))
         self.reply(200, self.page("Actions", body, "/actions", flash, bad))
+
+    def override_form(self, sch, held):
+        """The Override section: what is in force, and on or off for a while (a length, or until a time)."""
+        mode = next((k.get("value") for k in sch.get("keys", []) if k.get("key") == "POWER_MODE"), "")
+        lengths = ((("", "Until TV On or TV Off"),) if mode in ("schedule", "motion") else ()) + LENGTHS
+        opts = "".join(f'<option value="{v}">{label}</option>' for v, label in lengths)
+        clear = '<button class="quiet" name="override" value="clear">Clear Override</button>' if held not in (
+            "none", "unknown") else ""
+        csrf = csrf_input(self.sess)
+        return (f'<h2>Override</h2><form method="post" action="{self.base}/actions" class="card">{csrf}'
+                f'<p>Now: {e(cap(held))}. Forces the TV on or off over the power mode until it ends, through '
+                f'restarts and reboots; then the power mode takes over again.</p><div class="grid">'
+                f'<div class="field"><label for="for">For</label><select id="for" name="for">{opts}</select></div>'
+                f'<div class="field"><label for="until">Or Until</label><input type="time" id="until" name="until">'
+                f'<p class="hint">A time here wins over For.</p></div></div><div class="row">'
+                f'<button name="override" value="on">Force On</button>'
+                f'<button name="override" value="off">Force Off</button>{clear}</div></form>')
 
     def logs_page(self, method, form):
         names = {"kiosk": "Kiosk", "power": "TV Power", "net": "Wi-Fi Networks"}
@@ -1239,6 +1298,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, logs((which,) if which else LOGS))
         if route == ("GET", "/api/wifi"):
             return self.json(200, {"networks": networks()})
+        if route == ("POST", "/api/override"):
+            ok, msg = override(data.get("override"), data.get("for", ""), data.get("until", ""))
+            return self.json(200 if ok else 400, {"ok": ok, "message": msg} if ok else {"error": msg})
         if route == ("POST", "/api/update"):
             ok, out, err = tvlink("update", str(data.get("url", "")), str(data.get("sha256", "")), timeout=330)
             return self.json(200 if ok else 400, {"ok": ok, "message": out or err})
@@ -1362,6 +1424,16 @@ def test():
         assert check_password("long enough pw", read_file(os.path.join(tmp, "password")))
         assert claim_code() == "" and claim(code, "long enough pw", "long enough pw") == "Already claimed"
     assert duration(59) == "0 min" and duration(3700) == "1 h 1 min" and duration(90000) == "1 d 1 h"
+    # Overrides: only these arguments reach sudo; a time wins over a length; clear takes none
+    assert override_args("on") == ["on"] and override_args("off", "4h") == ["off", "4h"]
+    assert override_args("on", "4h", "07:00") == ["on", "until", "07:00"] and override_args("clear", "4h") == ["clear"]
+    for bad in (("sideways",), (None,), ("on", "4h; reboot"), ("on", "", "7pm"), ("on", 4), ("on", "", "--x")):
+        try:
+            override_args(*bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    assert override("sideways") == (False, "override is on, off or clear")
     # Behind a tunnel: the Secure flag from either header; the visitor's IP only from cloudflared on loopback
     req = lambda peer, **h: types.SimpleNamespace(client_address=(peer, 1),
                                                   headers={k.replace("_", "-"): v for k, v in h.items()})
@@ -1407,6 +1479,7 @@ def test_fleet():
     assert badge({"state": "network", "host": "b.example.com"}) == ("bad", "Offline")
     assert badge({"state": "folder", "host": ""}) == ("live", "Local Content")
     assert badge({"state": "setup"}) == ("warn", "Ready to Set Up")
+    assert cap("on until Tue 10 Nov 07:00") == "On until Tue 10 Nov 07:00" and cap("") == ""
     assert ago(1000, 1030) == "Just now" and ago(1000, 1000 + 3700) == "1 h 1 min ago"
 
     # Remote, against stand-in units: the tokens it sends, redirects never followed, every failure says what to check
@@ -1465,6 +1538,7 @@ def test_fleet():
     assert fast.screen()[0] == b"\xff\xd8JPEG" and len(seen) == n  # the same screenshot is fetched once
     assert fast.action("reload") == (True, "did reload")
     assert fast.save({"OVERLAY_CORNER": "middle"}) == (False, "OVERLAY_CORNER is ...", "OVERLAY_CORNER")
+    assert fast.override("on", "4h")[0] and seen[-1][0] == "/fast/api/override"
     n = len(seen)
     for kind, says in (("access", "Cloudflare Access service token"), ("deny", "HTTP 403"),
                        ("revoked", "refused its API token")):

@@ -16,7 +16,8 @@ python3 tvlink-content test
 
 The self-tests cover the settings parser (through `tvlink show`, including `CEC=0` as `POWER_METHOD=none`), the power
 modes, presence and clock logic (including clock changes), every power mode with every power method through a day
-(no re-wake loop with IR), the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
+(no re-wake loop with IR), overrides (over each mode through a day, their end by length, time or the next on-hours boundary across clock
+changes, the root-only file, the console's arguments), the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
 tokens, login rate limit (and the visitor's address through a tunnel), settings forms, power methods and API tokens;
 the daily browser restart's timing (once on the day clocks go back, an hour late when they go forward, never in the
 first hour after boot or while dark); synced content's manifest checks, https-only redirects, and syncs against a
@@ -68,6 +69,9 @@ tests/vm.sh
 - an unplugged TV;
 - a TV that drops hotplug in standby;
 - motion wake in `manual+motion`;
+- overrides: on in off-hours wakes the TV, holds through a tvlink-power restart, and ends back in standby; the file
+  root-only; clear; off until a time in on-hours; a bad length refused, and `always` asking for one; through the
+  console's API (Status shows it, Actions offers Clear Override) and through the fleet;
 - IR: the transmitter and receiver overlays in `config.txt` (gone again with `cec`), status `unknown`, each built-in
   brand's on and off codes decoded as sent, a brand without codes refused, learning on and off from a stand-in remote
   (stored root-only) and sending them, and tvlink-power sending the on code at start;
@@ -161,6 +165,8 @@ or after a change that touches them, check on the bench with a fresh card and re
 - A 72 h soak on 1 GB with a real page: lowest available memory, zram use, OOM kills, temperature,
   `vcgencmd get_throttled`; `/home/kiosk` still empty and `du -sh /run/tvlink` small (the GPU's shader cache).
 - Connect survives a reboot and a power cut; `wdctl` shows the watchdog; Wi-Fi power save is off.
+- Overrides: `tvlink override off until` a time across the nightly reboot and a power cut, and `on` through a clock
+  change; each ends on time and the mode takes over (`schedule` turns the TV back, `manual` leaves it).
 - Motion: a PIR wakes the TV outside on-hours and standby follows after `IDLE_MIN`; `manual+motion` wakes on arrival
   and leaves a TV switched off by hand alone.
 - `tvlink set WIFI2_SSID=... WIFI2_PSK=...` adds the network without a reboot, and the unit joins it when the first

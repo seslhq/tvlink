@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
 """TV power: always on, on-hours, plus motion wake, manual, or manual plus motion wake, by any POWER_METHOD.
-Usage: tvlink-power [test]
+Usage: tvlink-power [test] | tvlink-power override [on|off [DURATION|until HH:MM]|clear] (as tvlink override)
 
 POWER_MODE in tvlink.conf:
   always    on 24/7
@@ -22,9 +22,15 @@ TV may still be coming on. Until the clock can be trusted (NTP synced, or the RT
 POWER_METHOD: how `tvlink on|off` reaches the TV. cec answers status queries. ir never does (status unknown), so it is
 handled as a TV that never answers: codes at the boundaries and after a power cut, never a re-wake loop. signal
 reports what was last sent (on or off; off counts as standby). none: this exits.
+
+An override (tvlink override) forces the TV on or off over any mode until an instant it stores, so a restart, a
+reboot or a clock change keeps it; it is honoured once the clock can be trusted. While it lasts the TV is handled as in
+on-time (on) or off-hours (off); when it ends the mode takes over again, and manual modes send nothing.
 """
 import glob
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +45,8 @@ PLANNED = os.environ.get("TVLINK_PLANNED", "/boot/firmware/.tvlink-planned-reboo
 SYNCED = "/run/systemd/timesync/synchronized"  # timesyncd creates it once NTP has synced this boot
 RTC = "/sys/class/rtc/rtc0/since_epoch"  # Pi 5 RTC: kept across a warm reboot, across a power cut only with a battery
 CLOCK_FLOOR = 1793491200  # 2026-11-01: an RTC reading before this has lost power
+OVERRIDE = os.environ.get("TVLINK_OVERRIDE", "/var/lib/tvlink/override")  # root only: {"power": "on", "until": epoch}
+MAX_OVERRIDE = 31 * 86400
 
 
 def read_conf(cli=CLI, **run):
@@ -69,6 +77,16 @@ def want_on(mode, now, on, off, motion_age, idle_s):
     if mode == "always" or in_hours(now, on, off):
         return True
     return mode == "motion" and motion_age is not None and motion_age < idle_s
+
+
+def wanted(mode, now, on, off, motion_age, idle_s, override=None, trusted=True):
+    """True (on), False (standby), or None: manual modes have no say. An override wins once the clock can be trusted;
+    until then the TV stays on in the other modes."""
+    if trusted and override:
+        return override == "on"
+    if mode.startswith("manual"):
+        return None
+    return not trusted or want_on(mode, now, on, off, motion_age, idle_s)
 
 
 def presence(last, now, seen, idle_s):
@@ -139,6 +157,72 @@ def follow_up(action, seen, answered):
     return None
 
 
+def next_at(now, times):
+    """The first instant after now (naive local) at one of the times of day: today or tomorrow, as on-hours count."""
+    ts = now.timestamp()
+    return min(b for day in (now.date(), now.date() + timedelta(1)) for t in times
+               if (b := datetime.combine(day, t).timestamp()) > ts)
+
+
+def until(args, now, mode, on, off):
+    """When an override set now ends: [] the next TV_ON or TV_OFF (schedule and motion only), ["4h"] (d, h, m, eg
+    1h30m), or ["until", "07:00"] its next time. ValueError says what to give instead."""
+    if not args:
+        if mode not in ("schedule", "motion"):
+            raise ValueError(f"POWER_MODE={mode} has no on-hours to end it: give a time, eg 4h or until 07:00")
+        return next_at(now, (on, off))
+    if len(args) == 2 and args[0] == "until" and (t := hhmm(args[1])):
+        return next_at(now, (t,))
+    m = re.fullmatch(r"(?:(\d{1,3})d)?(?:(\d{1,4})h)?(?:(\d{1,5})m)?", args[0]) if len(args) == 1 else None
+    secs = sum(int(n or 0) * k for n, k in zip(m.groups(), (86400, 3600, 60))) if m else 0
+    if not 60 <= secs <= MAX_OVERRIDE:
+        raise ValueError("Give how long, eg 30m, 4h, 1h30m or 2d (31d at most), or until HH:MM")
+    return now.timestamp() + secs
+
+
+def read_override(path=None, now=None):
+    """(power, until) of the override in force, or None: none set, unreadable, or ended."""
+    try:
+        with open(path or OVERRIDE) as f:
+            o = json.load(f)
+        power, end = o["power"], float(o["until"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (power, end) if power in ("on", "off") and end > (time.time() if now is None else now) else None
+
+
+def when(ts):
+    return time.strftime("%a %d %b %H:%M", time.localtime(ts))  # eg Tue 10 Nov 07:00
+
+
+def override(args, path=None):
+    """tvlink override: show, set (on|off [DURATION|until HH:MM]) or clear. Written root only, beside then renamed."""
+    path = path or OVERRIDE
+    if not args:
+        o = read_override(path)
+        return f"{o[0]} until {when(o[1])}" if o else "none"
+    if args == ["clear"]:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return "Override cleared: back to the power mode"
+    if args[0] not in ("on", "off"):
+        raise ValueError("Usage: sudo tvlink override [on|off [DURATION|until HH:MM]|clear]")
+    conf = read_conf(CLI)
+    if conf.get("POWER_METHOD", "cec") == "none":
+        raise ValueError("POWER_METHOD=none: the Pi never turns the TV on or off")
+    mode, on, off, _, _ = settings(conf)
+    end = until(args[1:], datetime.now(), mode, on, off)
+    fd = os.open(f"{path}.tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"power": args[0], "until": int(end)}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(f"{path}.tmp", path)
+    return f"Override: TV {args[0]} until {when(end)}"
+
+
 def tv(action):
     """tvlink on|off|status. Returns its output (status: on, standby or unknown); on and off output also goes to the
     journal. A hung cec-ctl raises after 60 s and systemd restarts the service."""
@@ -167,43 +251,53 @@ def main():
         if glob.glob("/dev/cec*"):
             break
         time.sleep(1)
+    trusted = clock_ok()
     if mode.startswith("manual"):
+        forced = trusted and read_override()  # an override in force decides, not the power cut
         print(f"POWER_MODE={mode} by {method}: "
-              + ("power cut, waking the TV" if power_cut else "leaving the TV alone"),
+              + ("power cut, waking the TV" if power_cut and not forced else "leaving the TV alone"),
               flush=True)
         woke = False
-        for _ in range(20 if power_cut else 0):  # the TV may still be starting up after the same cut
+        for _ in range(20 if power_cut and not forced else 0):  # the TV may still be starting up after the same cut
             seen = tv("status")
             if seen == "on" or (woke and seen != "standby"):  # stop once a wake got through: no input grabbing
                 break
             woke = "woken" in tv("on")
             time.sleep(30)
-        last = time.monotonic()  # anyone here at a start (power cut, reboot, tvlink set) counts as already here
         if pir is not None:
             print(f"Motion wake after {idle // 60} min with nobody seen", flush=True)
-        while pir is not None:  # manual+motion: wake on an arrival, never send standby
-            wake, last = presence(last, time.monotonic(), pir.motion_detected, idle)
-            if wake:
-                print("Motion after a quiet spell: waking the TV", flush=True)
-                tv("on")
-            time.sleep(1)
-        return
-    print(f"POWER_MODE={mode} by {method}" + ("" if mode == "always" else f" {on:%H:%M}-{off:%H:%M}")
-          + (f", idle {idle // 60} min" if mode == "motion" else ""), flush=True)
-    trusted = clock_ok()
-    if not trusted:
-        print("Clock not set yet (no NTP sync, no RTC time): keeping the TV on until it is", flush=True)
+    else:
+        print(f"POWER_MODE={mode} by {method}" + ("" if mode == "always" else f" {on:%H:%M}-{off:%H:%M}")
+              + (f", idle {idle // 60} min" if mode == "motion" else ""), flush=True)
+        if not trusted:
+            print("Clock not set yet (no NTP sync, no RTC time): keeping the TV on until it is", flush=True)
     settle_until = time.monotonic() + 600 if power_cut else 0.0  # a TV set to come back on after a cut may be slow
-    prev, next_check, motion_at, state, answered = None, 0.0, None, None, False
+    prev, next_check, motion_at, state, answered, held = None, 0.0, None, None, False, None
+    last = time.monotonic()  # manual+motion: anyone here at a start (power cut, reboot, tvlink set) is already here
     while True:
         if not trusted and clock_ok():
             trusted = True
             print("Clock set", flush=True)
         now = time.monotonic()
-        if pir is not None and pir.motion_detected:  # held high while someone stays, eg retriggering PIR or mmWave
+        moving = pir is not None and pir.motion_detected  # held high while someone stays, eg PIR or mmWave
+        if moving:
             motion_at = now
+        o = read_override() if trusted else None
+        if (o and o[0]) != held:
+            print(f"Override: TV {o[0]} until {when(o[1])}" if o else f"Override over: back to POWER_MODE={mode}",
+                  flush=True)
+            held = o and o[0]
         age = None if motion_at is None else now - motion_at
-        want = not trusted or want_on(mode, datetime.now(), on, off, age, idle)
+        want = wanted(mode, datetime.now(), on, off, age, idle, held, trusted)
+        if mode == "manual+motion":  # wake on an arrival, never send standby
+            wake, last = presence(last, now, moving, idle)
+            if wake and want is None:
+                print("Motion after a quiet spell: waking the TV", flush=True)
+                tv("on")
+        if want is None:  # manual, no override: the TV is left alone
+            prev = None
+            time.sleep(1)
+            continue
         if prev is None:  # first tick: wake in on-hours, one standby in off-hours (a restart must not leave it on)
             prev = not want
         action = step(want, prev, now >= next_check, now < settle_until)
@@ -227,7 +321,7 @@ def main():
 
 def test():
     import tempfile
-    global STARTED, PLANNED, SYNCED, RTC
+    global STARTED, PLANNED, SYNCED, RTC, CLI
     d = lambda h, m=0: datetime(2026, 1, 1, h, m)
     six, ten, two = dtime(6), dtime(22), dtime(2)
     assert in_hours(d(6), six, ten) and in_hours(d(21, 59), six, ten) and not in_hours(d(22), six, ten)
@@ -300,6 +394,43 @@ def test():
             else:  # one standby after the cut, which the TV reports; the 12:00 standby undone at the next check
                 assert ons == ([3, 12] if mode == "always" else [6, 12]), (mode, method, sent)
                 assert sent.count((3, "off")) == (0 if mode == "always" else 1), (mode, method, sent)
+    # Overrides through a day in each mode: on from 23:00 to 01:00, off from 12:00 to 14:00. Each mode takes over again
+    # when one ends; manual modes send nothing then. Until the clock can be trusted they wait.
+    for mode in MODES:
+        prev, sent = None, []
+        for t in range(0, 24 * 3600, 60):
+            now = d(3) + timedelta(seconds=t)
+            want = wanted(mode, now, six, ten, None, 900, {23: "on", 0: "on", 12: "off", 13: "off"}.get(now.hour))
+            if want is None:
+                prev = None
+                continue
+            prev = not want if prev is None else prev
+            if action := step(want, prev, False):
+                sent.append((now.hour, action))
+            prev = want
+        assert sent == {"always": [(3, "on"), (12, "off"), (14, "on")],
+                        "manual": [(12, "off"), (23, "on")], "manual+motion": [(12, "off"), (23, "on")]}.get(
+            mode, [(3, "off"), (6, "on"), (12, "off"), (14, "on"), (22, "off"), (23, "on"), (1, "off")]), (mode, sent)
+    assert wanted("schedule", d(3), six, ten, None, 900, "off", trusted=False) is True
+    assert wanted("manual", d(3), six, ten, None, 900, "on", trusted=False) is None
+    # When one ends: the next TV_ON or TV_OFF by default (modes with hours only), a duration, or a time's next pass;
+    # instants, so a clock change in between counts real hours.
+    ts = lambda *a: datetime(*a).timestamp()
+    assert until([], d(23), "schedule", six, ten) == ts(2026, 1, 2, 6) and until([], d(12), "motion", six, ten) == \
+        ts(2026, 1, 1, 22)
+    assert until(["4h"], d(12), "always", six, ten) == ts(2026, 1, 1, 16)
+    assert until(["1h30m"], d(12), "manual", six, ten) - d(12).timestamp() == 5400
+    assert until(["2d"], d(12), "manual", six, ten) - d(12).timestamp() == 2 * 86400
+    assert until(["until", "07:00"], d(23), "always", six, ten) == ts(2026, 1, 2, 7)
+    assert until(["until", "7:00"], d(6), "always", six, ten) == ts(2026, 1, 1, 7)
+    assert until(["until", "03:00"], datetime(2026, 4, 5, 1), "always", six, ten) - ts(2026, 4, 5, 1) == 3 * 3600
+    assert until(["until", "07:00"], datetime(2026, 10, 4, 1), "always", six, ten) - ts(2026, 10, 4, 1) == 5 * 3600
+    for bad in ([], ["0m"], [""], ["32d"], ["4x"], ["h"], ["until"], ["until", "25:00"], ["4h", "x"]):
+        try:
+            until(bad, d(12), "always", six, ten)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
     assert settings({"POWER_MODE": "motion", "TV_ON": "06:00"})[0] == "always"
     assert settings({"POWER_MODE": "schedule", "TV_ON": "06:00", "TV_OFF": "06:00"})[0] == "always"
     assert settings({"POWER_MODE": "bogus"})[0] == "always"
@@ -329,6 +460,36 @@ def test():
         os.remove(RTC)
         open(SYNCED, "w").close()
         assert clock_ok()
+    # The override file: kept until its instant, nothing from a bad one; set, shown and cleared as tvlink override
+    with tempfile.TemporaryDirectory() as tmp:
+        path, conf = os.path.join(tmp, "override"), os.path.join(tmp, "tvlink.conf")
+        for text, want in (('{"power": "on", "until": 1000}', ("on", 1000.0)), ('{"power": "x", "until": 1000}', None),
+                           ('{"power": "off"}', None), ("{", None), ("[]", None)):
+            with open(path, "w") as f:
+                f.write(text)
+            assert read_override(path, 999) == want and read_override(path, 1000) is None, text
+        CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tvlink")
+        os.environ["TVLINK_CONF"] = conf
+        with open(conf, "w") as f:
+            f.write("POWER_MODE=always\n")
+        assert override(["off", "90m"], path).startswith("Override: TV off until ")
+        assert os.stat(path).st_mode & 0o777 == 0o600 and read_override(path)[0] == "off"
+        assert override([], path).startswith("off until ") and override(["clear"], path).startswith("Override cleared")
+        assert override([], path) == "none" and override(["clear"], path)
+        for bad in (["on"], ["sideways"], ["on", "until", "noon"]):  # always has no hours to end it
+            try:
+                override(bad, path)
+                raise AssertionError(bad)
+            except ValueError:
+                pass
+        with open(conf, "w") as f:
+            f.write("POWER_METHOD=none\n")
+        try:
+            override(["on", "1h"], path)
+            raise AssertionError("none")
+        except ValueError as e:
+            assert "POWER_METHOD=none" in str(e)
+        del os.environ["TVLINK_CONF"]
     # The conf as staff edit it on a PC, read through the sibling tvlink: never run, odd lines handled.
     with tempfile.TemporaryDirectory() as tmp:
         conf = os.path.join(tmp, "tvlink.conf")
@@ -364,4 +525,12 @@ def test():
 
 
 if __name__ == "__main__":
-    test() if sys.argv[1:] == ["test"] else main()
+    if sys.argv[1:] == ["test"]:
+        test()
+    elif sys.argv[1:2] == ["override"]:
+        try:
+            print(override(sys.argv[2:]))
+        except ValueError as e:
+            sys.exit(str(e))
+    else:
+        main()
