@@ -31,6 +31,8 @@ through power cuts, network drops and browser crashes without a site visit.
 - **TV power three ways.** HDMI-CEC; infrared with built-in discrete codes for common brands or codes learned from
   the TV's remote; or the HDMI signal off and on, for TVs that sleep without one. Always on, on-hours, a motion
   sensor, the TV remote, or the remote plus motion wake, with any of them.
+- **A steady HDMI link.** Optional forced hotplug and a captured EDID, so a TV that is off or on another input at
+  boot still gets the right picture.
 - **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
   and security updates staged so a few units take them first.
 - **A console on every unit.** Web pages and a JSON API on the unit itself: the screen, health, settings, actions,
@@ -92,13 +94,13 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi
-and the motion sensor, and runs 140 checks against the real services: [docs/testing.md](docs/testing.md).
+and the motion sensor, and runs 161 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
 | Guide | Covers |
 | --- | --- |
-| [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor and IR |
+| [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, EDID, wiring a motion sensor and IR |
 | [Configuration](docs/configuration.md) | Every setting, power modes and methods, local content |
 | [Console](docs/console.md) | The unit's web pages and JSON API, claiming, security |
 | [Cloudflare](docs/cloudflare.md) | A tunnel per unit, Access in front, a service token for the fleet console |

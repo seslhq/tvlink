@@ -69,8 +69,18 @@ printf '{"URLBlocklist": ["devtools://*", "view-source:*", "chrome://*"], "Allow
 
 # No rainbow screen from the firmware.
 grep -q '^disable_splash=1' "$BOOT/config.txt" || printf '\n[all]\ndisable_splash=1\n' >>"$BOOT/config.txt"
-# cmdline.txt (HDMI mode, a quiet boot) and config.txt (IR overlays) from the settings: tvlink boot.
+# cmdline.txt (HDMI mode, hotplug, EDID, a quiet boot) and config.txt (IR overlays) from the settings: tvlink boot.
 TVLINK_CONF="$CONF" ./tvlink boot
+# Captured EDIDs (tvlink edid capture) go into the initramfs too, for a display driver loaded from it.
+mkdir -p /etc/initramfs-tools/hooks
+cat >/etc/initramfs-tools/hooks/tvlink-edid <<'EOF'
+#!/bin/sh
+[ "$1" = prereqs ] && exit 0
+. /usr/share/initramfs-tools/hook-functions
+for f in /lib/firmware/edid/tvlink-*.bin; do [ -f "$f" ] && copy_file firmware "$f"; done
+exit 0
+EOF
+chmod 755 /etc/initramfs-tools/hooks/tvlink-edid
 
 # Raspberry Pi Connect (preinstalled on Lite) runs as the admin user's service: keep it up without a login.
 [ -z "${SUDO_USER:-}" ] || loginctl enable-linger "$SUDO_USER"

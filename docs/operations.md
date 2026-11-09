@@ -17,6 +17,7 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 | `tvlink show`, `sudo tvlink set KEY=value` | Read and change settings ([configuration](configuration.md)) |
 | `sudo tvlink on`, `sudo tvlink off`, `tvlink status` | TV power by `POWER_METHOD`, and what is known of the TV: CEC's answer, the signal last sent, or `unknown` (IR) |
 | `sudo tvlink ir learn on\|off`, `sudo tvlink ir test on\|off` | Record a power code from the TV's remote; send one once ([IR](setup.md#ir-transmitter-and-receiver)) |
+| `sudo tvlink edid capture\|clear` | Keep the TV's EDID for boot, or forget it; reboot to apply |
 | `sudo tvlink doctor` | Health on one screen: page, services, clock, power and heat, memory, disk, HDMI, CEC or IR, Wi-Fi |
 | `sudo tvlink screenshot` | Saves what the TV shows to `/run/tvlink/screen.jpg` |
 | `sudo tvlink identify` | Puts the unit's name and IP across the screen for up to 60 s |
@@ -86,6 +87,9 @@ halfway: `journalctl -u tvlink-update -f`.
   brand codes or learn them. A phone camera shows the LED flash during `sudo tvlink ir test on`.
 - Signal off but the TV stays on: the TV has no no-signal standby, or it is set long; use CEC or IR. The kiosk log
   shows `HDMI signal off (HDMI-A-1)` when it acts.
+- No picture or the wrong modes after a cut while the TV was off or on another input: `tvlink edid capture` and
+  `HDMI_FORCE_HOTPLUG=1` ([setup](setup.md#tv-settings-and-hdmi-cec)); `sudo tvlink doctor` says `(reboot to apply)`
+  until the kernel uses them.
 - A server page such as 404 on the TV: the page answered, so tvlink shows its answer, with `Board not found` on the
   badge.
 - Black screen: the HDMI cable in HDMI0, the TV input, and `systemctl status tvlink`.

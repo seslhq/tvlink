@@ -28,7 +28,7 @@ infrared discrete codes nor the HDMI signal.
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
 | `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
 | `tvlink check` | root | Gate for the nightly reboot timer |
-| `tvlink boot` | root | Writes `cmdline.txt` and `config.txt` from the settings; run by install.sh and `tvlink set` |
+| `tvlink boot` | root | Writes `cmdline.txt` and `config.txt` from the settings; run by install.sh, `tvlink set` and `tvlink edid` |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
 
 One prober feeds everyone: the splash reads `status.js` as JSONP from `file://`, and the agent reads the same file for
@@ -73,9 +73,12 @@ badge state in over the DevTools pipe instead.
   30 s and after every kiosk start too, so the signal stays as asked across browser restarts. cage keeps running with
   no output on; Chromium does too, but makes no page without one, so the kiosk starts with the output on and the
   agent turns it off once the page is up. The agent skips the frozen-page check while the signal is off.
-- **Boot files from the settings.** `tvlink boot` owns tvlink's arguments on `cmdline.txt` (mode, quiet boot) and a
-  marked block at the end of `config.txt` (IR overlays), leaves the rest alone, and writes only on a change, beside
-  then renamed.
+- **Boot files from the settings.** `tvlink boot` owns tvlink's arguments on `cmdline.txt` (mode, quiet boot,
+  `vc4.force_hotplug`, `drm.edid_firmware`) and a marked block at the end of `config.txt` (IR overlays), leaves the
+  rest alone, and writes only on a change, beside then renamed. `vc4.force_hotplug` is a bitmask per port (bit 0:
+  HDMI0, in the Pi kernel's `vc4_hdmi.c`): tvlink sets 1, HDMI0 only, so the free port never shows as a screen.
+  Captured EDIDs live in `/lib/firmware/edid/` (where `drm.edid_firmware` looks) and an initramfs-tools hook copies
+  them into the initramfs, for a display driver loaded before the root file system.
 - **Nightly reboot as the backstop.** At 03:30, never in the first hour after boot, never while an upgrade runs, and
   skipped for up to a week while a configured page is down, so an outage keeps the last good screen.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the

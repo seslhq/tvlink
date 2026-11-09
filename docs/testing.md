@@ -48,6 +48,7 @@ tests/vm.sh
 | Site Wi-Fi | `mac80211_hwsim`: `wlan0` is the Pi's radio; two access points run in the `ap` network namespace: `tvlink-open` (open) and `tvlink-hidden` (hidden, WPA2) | `ip netns exec ap ...` |
 | Ethernet unplugged | `ip route del default dev eth0`; plug it back in with `networkctl reconfigure eth0` | |
 | IR LED, receiver and the TV's IR sensor | `rc-loopback`: what is sent on `/dev/lirc0` comes back on it, and the kernel's NEC and Sony decoders turn it into scancodes on its input device | `ir-ctl -d /dev/lirc0 -S nec:0x1234` (a remote) |
+| HDMI EDID | Apple's virtual display gives `Virtual-1` no EDID: a stand-in connector `/run/tvlink-test-drm/card1-HDMI-A-1` holds vivid's TV EDID | `TVLINK_DRM=...` |
 | Motion sensor | gpiozero's MockFactory, through a tvlink-power drop-in; GPIO17 follows the line written to the FIFO | `echo 1 >/run/pir17` (motion), `echo 0` (quiet) |
 | Board | `python3 -m http.server` on 127.0.0.1:8080 | `systemctl stop tvlink-test-board` |
 | GPU | wlroots software renderer (`WLR_RENDERER=pixman` drop-in) | |
@@ -87,7 +88,11 @@ tests/vm.sh
   pages through the fleet; a Reload through it reaches the TV; nothing without a login;
 - the HDMI signal: tvlink-power turns it on at start, `tvlink off` turns cage's output off and `tvlink on` back on,
   status and the console follow, the kiosk keeps running and logs no recovery for a minute in the dark, a kiosk
-  restart keeps it off, and the page shows again after.
+  restart keeps it off, and the page shows again after;
+- HDMI at boot: `HDMI_FORCE_HOTPLUG` adds and removes `vc4.force_hotplug=1` once, leaving the rest of `cmdline.txt`,
+  and a second set changes nothing; `tvlink edid capture` refuses the VM's own display (no EDID) and a corrupt EDID,
+  saves the stand-in's byte for byte, adds `drm.edid_firmware` once and the file to the initramfs; `clear` removes
+  all three; `tvlink doctor` shows both.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
@@ -123,6 +128,9 @@ or after a change that touches them, check on the bench with a fresh card and re
   `schedule` with IR across an on-time start and end, and a power cut in off-hours.
 - Signal: on a TV that sleeps without a signal, `tvlink off` puts it to sleep and `tvlink on` wakes it; how long it
   takes; the page and badge after a night dark; a kiosk restart and the nightly reboot while dark (the TV may wake).
+- HDMI at boot on a Pi 5: `tvlink edid capture` and `HDMI_FORCE_HOTPLUG=1`, then boot with the TV off, on another
+  input and unplugged: the right mode once it is back, and CEC keeps its address; check whether vc4 loads from the
+  initramfs (`lsinitramfs`) and that the EDID is found there (`dmesg | grep -i edid`).
 - TV standby with the Pi running: does it drop hotplug, and are the CEC address and picture size right after a wake.
 - A 4K TV: the default `1920x1080@60` holds after boot and after a wake; `RESOLUTION=auto` runs 4K.
 - 10 power cuts mid-page: it recovers by itself, the settings file is intact, one standby in off-hours, and `manual`

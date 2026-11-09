@@ -29,7 +29,7 @@ check "tvlink-power test" quiet python3 tvlink-power test
 check "tvlink-agent test" quiet python3 tvlink-agent test
 check "tvlink-console test" quiet python3 tvlink-console test
 # Settings the checks change, as an earlier run that stopped midway may have left them
-tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned >/dev/null
+tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned HDMI_FORCE_HOTPLUG=0 >/dev/null
 for u in tvlink tvlink-power tvlink-net tvlink-console; do
   check "$u running" within 10 systemctl -q is-active "$u"
 done
@@ -374,6 +374,41 @@ check "... the output is on" within 10 signal_is 1
 check "... status on" tv_is on
 out=$(tvlink screenshot); check "... and the page shows" says Saved
 tvlink set POWER_METHOD=cec POWER_MODE=schedule >/dev/null
+
+echo "== HDMI: forced hotplug and a captured EDID"
+arg() { tr ' ' '\n' </boot/firmware/cmdline.txt | grep -cx "$1"; } # times a kernel argument is there
+out=$(tvlink set HDMI_FORCE_HOTPLUG=1); check "force hotplug: reboot to apply" says 'Reboot to apply: cmdline.txt'
+check "... vc4.force_hotplug=1, once" test "$(arg vc4.force_hotplug=1)" = 1
+check "... the rest of cmdline.txt kept" test "$(arg root=/dev/vda1)$(arg quiet)" = 11
+sum=$(md5sum </boot/firmware/cmdline.txt)
+out=$(tvlink set HDMI_FORCE_HOTPLUG=1); check "... set again: no change" no says Reboot
+check "... cmdline.txt the same" test "$(md5sum </boot/firmware/cmdline.txt)" = "$sum"
+check "... in tvlink doctor" grep -q '^HDMI at boot: force hotplug on, EDID from the TV' <(tvlink doctor)
+tvlink set HDMI_FORCE_HOTPLUG=0 >/dev/null
+check "... off: gone" test "$(arg vc4.force_hotplug=1)" = 0
+out=$(tvlink edid capture 2>&1); check "EDID: no HDMI connector in the VM, nothing saved" says 'No EDID captured'
+out=$(TVLINK_DRM='/sys/class/drm/card*-*' tvlink edid capture 2>&1)
+check "... Virtual-1 has none (vz gives no EDID)" says 'Virtual-1: no valid EDID'
+# A connector with vivid's TV EDID stands in for a Pi's HDMI-A-1
+drm=/run/tvlink-test-drm/card1-HDMI-A-1
+mkdir -p "$drm" && echo connected >"$drm/status"
+python3 -c 'import sys; open(sys.argv[2], "wb").write(bytes.fromhex(open(sys.argv[1]).read()))' /run/tv-edid.hex \
+  "$drm/edid"
+cap() { TVLINK_DRM='/run/tvlink-test-drm/card*-HDMI-A-*' tvlink edid capture 2>&1; }
+out=$(cap); check "EDID captured" says 'HDMI-A-1: EDID saved'
+check "... byte for byte" cmp -s "$drm/edid" /lib/firmware/edid/tvlink-HDMI-A-1.bin
+check "... cmdline.txt loads it, once" test "$(arg drm.edid_firmware=HDMI-A-1:edid/tvlink-HDMI-A-1.bin)" = 1
+initrd() { lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null; }
+check "... in the initramfs" grep -q 'edid/tvlink-HDMI-A-1.bin$' <(initrd)
+out=$(cap); check "... captured again: cmdline.txt unchanged" no says 'Reboot to apply'
+check "... in tvlink doctor" grep -q '^HDMI at boot: force hotplug off, EDID tvlink-HDMI-A-1.bin' <(tvlink doctor)
+printf '\x01' | dd of="$drm/edid" bs=1 seek=20 conv=notrunc 2>/dev/null # a bad checksum
+out=$(cap); check "... a corrupt EDID refused" says 'no valid EDID'
+check "... the saved one kept" test -s /lib/firmware/edid/tvlink-HDMI-A-1.bin
+out=$(tvlink edid clear); check "EDID clear" says 'EDID cleared'
+check "... file gone" test ! -e /lib/firmware/edid/tvlink-HDMI-A-1.bin
+check "... cmdline.txt without it" quiet test "$(grep -c edid_firmware /boot/firmware/cmdline.txt)" = 0
+check "... initramfs without it" quiet test "$(initrd | grep -c tvlink-HDMI)" = 0
 
 echo "== $fails failed"
 [ "$fails" = 0 ]

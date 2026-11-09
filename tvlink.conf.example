@@ -44,6 +44,9 @@ IR_RX_PIN=23
 
 # HDMI output mode, eg 1920x1080@60 or 1280x720@60; auto = the TV's preferred mode. Set when the kiosk starts.
 RESOLUTION=1920x1080@60
+# 1 = HDMI0 counts as connected even while the TV is off or on another input (with sudo tvlink edid capture, the
+# Pi keeps the TV's modes). Needs a reboot.
+HDMI_FORCE_HOTPLUG=0
 
 # Corner of the status badge: bottom-right, bottom-left, top-right, top-left, or off.
 OVERLAY_CORNER=bottom-right

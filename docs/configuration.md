@@ -31,6 +31,7 @@ passwords and the tunnel token masked. The file is only ever read, never run, an
 | `IR_TX_PIN` | `18` | `ir`: GPIO (BCM number) driving the IR LED. Reboot to apply. |
 | `IR_RX_PIN` | `23` | `ir`: GPIO (BCM number) of the IR receiver, to learn codes; blank: none. Reboot to apply. |
 | `RESOLUTION` | `1920x1080@60` | HDMI mode, eg `1280x720@60`; `auto`: the TV's preferred mode. |
+| `HDMI_FORCE_HOTPLUG` | `0` | `1`: HDMI0 counts as connected while the TV is off, on another input or unplugged (`vc4.force_hotplug=1` on the kernel command line). Reboot to apply. |
 | `OVERLAY_CORNER` | `bottom-right` | Corner of the status badge: `bottom-right`, `bottom-left`, `top-right`, `top-left` or `off`. |
 | `WIFI_COUNTRY` | (blank) | Wi-Fi country code, eg `AU`. Blank keeps the one set in Imager. |
 | `WIFI1_SSID`, `WIFI1_PSK` | (blank) | A Wi-Fi network and its password (blank password: an open network). Hidden networks work. |
@@ -38,8 +39,8 @@ passwords and the tunnel token masked. The file is only ever read, never run, an
 | `TUNNEL_TOKEN` | (blank) | A Cloudflare Tunnel token: the console from anywhere over HTTPS ([Cloudflare](cloudflare.md)). Kept root-only in `/etc/tvlink/tunnel-token`, never in this file; set and cleared only with `tvlink set` or the console. Blank: no tunnel. |
 | `UPDATE_DAY` | (blank) | Blank: security updates every night (canary units). `Mon` to `Sun`: weekly on that day, after the canaries. Applied by rerunning install.sh. |
 
-Settings that change `cmdline.txt` or `config.txt` (`RESOLUTION`, `POWER_METHOD`, the IR pins) say `Reboot to
-apply` when they do; `tvlink set` writes those files the same safe way as the settings file.
+Settings that change `cmdline.txt` or `config.txt` (`RESOLUTION`, `HDMI_FORCE_HOTPLUG`, `POWER_METHOD`, the IR
+pins) say `Reboot to apply` when they do; `tvlink set` writes those files the same safe way as the settings file.
 
 Pages are best designed at 1920x1080: 1080p keeps a 4K TV sharp enough and the Pi cool. A mode the TV refuses is
 logged and the TV's own mode stays.

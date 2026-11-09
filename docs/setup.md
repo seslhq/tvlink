@@ -70,6 +70,18 @@ Some TVs drop HDMI hotplug in standby. The Pi then has no CEC address, and only 
 `tvlink on` sends it from the unregistered address. If the picture comes back at the wrong mode after a wake, the
 kiosk sets `RESOLUTION` again within 30 s.
 
+A TV that drops hotplug in standby, sits on another input, or is off when the Pi boots can leave the Pi with no
+screen or the wrong modes. With the TV on and showing the Pi, keep its EDID and ignore hotplug, then reboot:
+
+```bash
+sudo tvlink edid capture
+sudo tvlink set HDMI_FORCE_HOTPLUG=1
+sudo reboot
+```
+
+`sudo tvlink doctor` shows both on its `HDMI at boot` line; `sudo tvlink edid clear` and `HDMI_FORCE_HOTPLUG=0` undo
+them. The EDID goes to `/lib/firmware/edid/` and into the initramfs, so a display driver loaded from it finds it too.
+
 ## Motion sensor
 
 For `POWER_MODE=motion` or `manual+motion` ([power modes](configuration.md#power-modes)).
