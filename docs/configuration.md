@@ -36,6 +36,8 @@ passwords and the tunnel token masked. The file is only ever read, never run, an
 | `WIFI_COUNTRY` | (blank) | Wi-Fi country code, eg `AU`. Blank keeps the one set in Imager. |
 | `WIFI1_SSID`, `WIFI1_PSK` | (blank) | A Wi-Fi network and its password (blank password: an open network). Hidden networks work. |
 | `WIFI2_SSID`, `WIFI2_PSK` | (blank) | A second network, eg the next one when a site changes its Wi-Fi. |
+| `HOTSPOT` | `0` | `1`: after `HOTSPOT_MIN` minutes with no network, a Wi-Fi hotspot to reach the console from a phone ([below](#setup-hotspot)). |
+| `HOTSPOT_MIN` | `5` | Minutes with no network before the setup hotspot starts. |
 | `USB_CONTENT` | `0` | `1`: a USB stick with a `tvlink` folder plays as local content while it is in ([below](#local-content)). |
 | `CONTENT_URL` | (blank) | https link to a manifest of files, synced to the unit and played as local content ([below](#synced-content)). Blank: off. |
 | `CONTENT_SYNC_MIN` | `15` | Minutes between syncs of `CONTENT_URL`. |
@@ -124,6 +126,27 @@ Every power mode works with every method; only what the Pi can learn about the T
   the Pi boots (including the nightly reboot at 03:30) and for a few seconds when the kiosk restarts, so such a TV may
   wake then and sleep again on its own no-signal timer. The page keeps running in the dark; a crashed page is still
   recovered, and the frozen-page check pauses, so a dark screen is never taken for a fault.
+
+## Setup hotspot
+
+`HOTSPOT=1` is for units that may lose their Wi-Fi where nobody can edit the SD card, eg after a site changes its
+network. Once the unit has had no network for `HOTSPOT_MIN` minutes (no default route and no connection up, so a
+network without internet still counts as one), its Wi-Fi becomes a hotspot:
+
+- named `tvlink-<hostname>` (eg `tvlink-tv-lobby-01`), WPA2, with a new random password each time the unit falls
+  back to it, on 2.4 GHz channel 6 under `WIFI_COUNTRY`'s rules;
+- the TV shows the name, the password and the console's address, `http://10.42.0.1`: across the top of the splash,
+  over local content and the last good screen, or in the badge of a page shown offline. The console's Wi-Fi page
+  shows them too. The password is in no log; the name only in NetworkManager's, as for any network (it is broadcast
+  anyway);
+- a phone that joins gets an address and opens the console (claiming it with the code on the TV, if it has no
+  password yet), where the Wi-Fi page sets the network.
+
+The Pi has one radio: it can be the hotspot or join a network, not both. So the hotspot stops when the unit is online
+again (eg Ethernet plugged in), when a Wi-Fi setting is saved (the unit tries the networks at once; the phone loses
+the hotspot then, and if no network answers it comes back after `HOTSPOT_MIN` minutes with a new password), and
+every 10 minutes while no one is joined, for a 45-second try of the networks it knows, so a site network that comes
+back on its own is joined again. A unit with no network at all keeps falling back to it, which costs nothing.
 
 ## Local content
 

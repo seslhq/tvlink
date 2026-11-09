@@ -54,6 +54,8 @@ through power cuts, network drops and browser crashes without a site visit.
 
   ![The fleet overview](docs/images/fleet-overview.png)
 
+- **A setup hotspot, if you want one.** With `HOTSPOT=1`, a unit that has had no network for a few minutes opens its
+  own Wi-Fi, with the name and password on the TV, so a phone can reach its console and set the site's Wi-Fi.
 - **Managed remotely.** One text file on the SD card holds the settings, editable on any PC, in the console, or with
   `tvlink set` over Raspberry Pi Connect or SSH, which stay as a way in when the console can't be reached.
 
@@ -68,6 +70,7 @@ TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
                          tvlink-power.service    TV power over CEC, IR or the HDMI signal: schedule, motion sensor,
                                                  power-cut wake
                          tvlink-net.service      Wi-Fi networks from the settings file
+                         tvlink-hotspot.service  optional: a setup hotspot after a spell with no network
                          tvlink-console.service  the console on port 80: web pages and JSON API
                          tvlink-tunnel.service   optional: cloudflared, a Cloudflare Tunnel to the console
                          tvlink-content.service  optional: synced content from an https manifest
@@ -102,7 +105,7 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi,
-the motion sensor and a USB stick, and runs 254 checks against the real services: [docs/testing.md](docs/testing.md).
+the motion sensor and a USB stick, and runs 270 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 

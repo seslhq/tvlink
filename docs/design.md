@@ -24,6 +24,7 @@ infrared discrete codes nor the HDMI signal.
 | `tvlink-agent` | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, takes requests (screenshot, identify, reload) |
 | `tvlink-power` | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, overrides (`tvlink override`), clock trust, power-cut handling |
 | `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
+| `tvlink-hotspot` | root | Optional: a NetworkManager hotspot on `wlan0` after `HOTSPOT_MIN` minutes with no network |
 | `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
 | `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
@@ -143,6 +144,17 @@ badge state in over the DevTools pipe instead.
   home owned by root that it can't write (so nothing it plants runs later: user units, Python's user site,
   autostart), a managed policy blocking DevTools, browser pages, file dialogs and downloads. Root hands it requests
   through files in `/run/tvlink`, without a controlling terminal.
+- **A setup hotspot that takes turns with the Wi-Fi.** NetworkManager's own access point mode (`ipv4.method
+  shared`: its dnsmasq hands out addresses) in a profile held in RAM, so nothing new listens and the console, already
+  on every interface, is the only thing on it. One radio can't serve the hotspot and join a network at once, so the
+  hotspot makes way: when the unit is online again, at once when a Wi-Fi setting is saved (`tvlink set` restarts
+  `tvlink-hotspot`, and a restart is "try now"), and every 10 min while no one is joined, for a 45 s try of the known
+  networks, never while someone is setting it up. Offline means no default route and no NetworkManager connection
+  up, so a LAN without a gateway, where the console is reachable anyway, never starts it. A random password per
+  offline spell (12 characters without look-alikes, about 59 bits), shown only where someone at the TV or logged in
+  can see it: the splash, the badge and the console read `/run/tvlink-hotspot/state`; tvlink logs neither the name
+  nor the password; NetworkManager logs the name, as it does for any network it starts. The name is
+  `tvlink-<hostname>`: broadcast anyway, and the hostname is how people know the unit.
 - **Watchdog and Wi-Fi.** systemd's hardware watchdog reboots a hung kernel; Wi-Fi power save is off.
 - **A console on every unit, on by default, claimed with a code.** Day-to-day management is the unit's own console;
   Raspberry Pi Connect or SSH stay as break-glass. It is on from the first install so a unit can be set up from a

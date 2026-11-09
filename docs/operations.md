@@ -83,6 +83,8 @@ halfway: `journalctl -u tvlink-update -f`.
   `journalctl -u tvlink-console -b` has its own log, if the console itself is down: `systemctl status tvlink-console`.
 - Badge changes and page recoveries are in the same log: `journalctl -t tvlink -b | grep 'Badge\|Recover'`.
 - `Tunnel: not connected` in `tvlink doctor`: `journalctl -u tvlink-tunnel -b` ([Cloudflare](cloudflare.md)).
+- Setup hotspot: `journalctl -u tvlink-hotspot -b` says when it started and stopped, and why (it never logs the name or
+  password); the console's Logs page has it under Wi-Fi Networks. The TV and the console's Wi-Fi page show how to join.
 - `journalctl -u tvlink-power -b`: power mode, clock, wakes and standbys, `TV reports ...`, motion sensor problems.
 - Synced content: `tvlink content status`, then `journalctl -u tvlink-content -b` (it logs changes, not every
   unchanged sync). `Failed ...: <file>: checksum does not match` means the server's file and manifest differ:
@@ -115,8 +117,10 @@ halfway: `journalctl -u tvlink-update -f`.
   or no files.
 - Check the power supply is in a wall socket, the HDMI cable is in the Pi's port next to the power socket, Ethernet
   is plugged in if the site has it, and the TV is on the right input.
-- Wi-Fi password changed: take out the SD card, open `tvlink.conf` on any PC, set `WIFI1_SSID` and `WIFI1_PSK` to the
-  new network (in double quotes), put the card back and power on.
+- Wi-Fi password changed: with `HOTSPOT=1`, wait for the TV to show `Wi-Fi setup: join tvlink-...`, join that
+  network from a phone with the password shown, open `http://10.42.0.1`, log in, and set the network on the Wi-Fi
+  page; the hotspot stops and the unit joins it. Without it: take out the SD card, open `tvlink.conf` on any PC, set
+  `WIFI1_SSID` and `WIFI1_PSK` to the new network (in double quotes), put the card back and power on.
 - With `USB_CONTENT=1`, a USB stick with a `tvlink` folder of images or videos plays while it is plugged in (when the
   page is down, or with `SOURCE=folder`), no PC needed.
 - A full-screen picture with a red `Offline, from ...` badge is the last good screen (`LAST_GOOD=1`): the page has not

@@ -1,0 +1,183 @@
+#!/usr/bin/python3 -s
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+"""Setup hotspot. Usage: tvlink-hotspot | tvlink-hotspot test
+
+No argument: tvlink-hotspot.service, as root. With HOTSPOT=1, once the unit has had no network for HOTSPOT_MIN minutes
+(no IPv4 default route and no NetworkManager connection up), wlan0 becomes a WPA2 access point, tvlink-<hostname>,
+with a new random password, at 10.42.0.1 (NetworkManager's shared mode hands out addresses), so a phone can join it and
+open the console. Name, password and address go to /run/tvlink-hotspot/state for the splash, the badge and the console
+only; nothing here logs them. One radio can't be an access point and join a network at once, so it stops:
+- when the unit is online again (eg Ethernet plugged in);
+- when a Wi-Fi setting is saved: tvlink set restarts this service, and the unit tries the networks at once;
+- every 10 min with nobody joined, for a 45 s try of the networks it knows; it comes back if none answers.
+A restart is "try the networks now"; stopping the service takes the hotspot down.
+"""
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import time
+
+CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
+STATE = os.environ.get("TVLINK_HOTSPOT_STATE", "/run/tvlink-hotspot/state")
+NAME, DEV, ADDR = "tvlink-hotspot", "wlan0", "10.42.0.1"  # the NetworkManager profile (in RAM only), radio, address
+RETRY, TRY, TICK = 600, 45, 10  # seconds: up with nobody joined before a try, that try's limit, between looks
+CHARS = "abcdefghjkmnpqrstuvwxyz23456789"  # no i, l, o, 0 or 1: read off a TV, typed on a phone
+
+
+def run(*cmd, timeout=60):
+    """(ok, stdout). Its output is never logged: it can hold the password."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode == 0, p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+
+
+def read_conf(cli=CLI):
+    """Settings as tvlink reads them (tvlink show). Empty means unset."""
+    out = run(cli, "show")[1]
+    return {k: v for k, v in (line.split("=", 1) for line in out.splitlines() if "=" in line) if v}
+
+
+def ssid(host):
+    """tvlink-<hostname>, cut to the 32 bytes an SSID holds (hostnames are ASCII)."""
+    return f"tvlink-{host}"[:32]
+
+
+def password():
+    """12 letters and digits in fours, eg abcd-efgh-jkmn: about 59 bits, a fresh one each time it starts."""
+    c = "".join(secrets.choice(CHARS) for _ in range(12))
+    return "-".join(c[i:i + 4] for i in range(0, 12, 4))
+
+
+def connected(route, active):
+    """Online: a default route (ip -4 route show default), or a connection NetworkManager has up (nmcli -t -f
+    NAME,TYPE,STATE connection show --active) other than loopback and the hotspot, eg a LAN without a gateway."""
+    if route.strip():
+        return True
+    for line in active.splitlines():
+        name, kind, state = (line.rsplit(":", 2) + ["", ""])[:3]  # names may hold escaped colons: split from the right
+        if state == "activated" and kind != "loopback" and name != NAME:
+            return True
+    return False
+
+
+def online():
+    return connected(run("ip", "-4", "route", "show", "default")[1],
+                     run("nmcli", "-t", "-f", "NAME,TYPE,STATE", "connection", "show", "--active")[1])
+
+
+def decide(up, on, offline_s, up_s, joined, wait_s):
+    """This tick's move: start, stop, retry (down for a try of the known networks) or None."""
+    if on:
+        return "stop" if up else None
+    if not up:
+        return "start" if offline_s >= wait_s else None
+    return "retry" if up_s >= RETRY and not joined else None
+
+
+def save(name, psk, path=None):
+    """Name, password and console address, one a line, for the splash, the agent and the console: readable by all,
+    as the TV shows them anyway. Beside, then renamed."""
+    path = path or STATE
+    with open(path + ".tmp", "w") as f:
+        f.write(f"{name}\n{psk}\nhttp://{ADDR}\n")
+    os.chmod(path + ".tmp", 0o644)
+    os.replace(path + ".tmp", path)
+
+
+def start(name, psk):
+    """The access point: WPA2 (CCMP), 2.4 GHz channel 6, legal in every country and seen by every phone."""
+    stop()
+    run("nmcli", "radio", "wifi", "on")
+    ok = run("nmcli", "connection", "add", "save", "no", "type", "wifi", "con-name", NAME, "ifname", DEV,
+             "autoconnect", "no", "ssid", name, "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+             "802-11-wireless.channel", "6", "ipv4.method", "shared", "ipv4.addresses", f"{ADDR}/24",
+             "ipv6.method", "disabled", "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
+             "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp", "wifi-sec.psk", psk)[0]
+    if ok and run("nmcli", "-w", "30", "connection", "up", NAME)[0]:
+        save(name, psk)
+        return True
+    stop()
+    return False
+
+
+def stop():
+    try:
+        os.remove(STATE)
+    except FileNotFoundError:
+        pass
+    run("nmcli", "connection", "delete", NAME)
+
+
+def main():
+    conf = read_conf()
+    if conf.get("HOTSPOT") != "1":
+        return
+    wait = int(conf.get("HOTSPOT_MIN") or 5) * 60
+    print(f"Setup hotspot after {wait // 60} min with no network", flush=True)
+    up, psk, since, up_at = False, None, time.monotonic(), 0.0
+    while True:
+        now, on = time.monotonic(), online()
+        if on:
+            since, psk = now, None  # the next spell offline gets a new password
+        joined = up and bool(run("iw", "dev", DEV, "station", "dump")[1].strip())
+        move = decide(up, on, now - since, now - up_at, joined, wait)
+        if move == "stop":
+            stop()
+            up = False
+            print("Hotspot off: back online", flush=True)
+        elif move == "retry":
+            stop()
+            up = False
+            run("nmcli", "-w", str(TRY), "device", "connect", DEV, timeout=TRY + 15)
+            if online():
+                print("Hotspot off: joined a network", flush=True)
+            else:
+                move = "start"
+        if move == "start":
+            psk = psk or password()
+            up, up_at = start(ssid(socket.gethostname()), psk), time.monotonic()
+            if up:
+                print(f"Hotspot on: no network for {round((now - since) / 60)} min", flush=True)
+            else:
+                print("Can't start the hotspot: is there a Wi-Fi radio (wlan0)?", flush=True)
+                since = up_at  # try again after another wait
+        time.sleep(TICK)
+
+
+def test():
+    import tempfile
+    global STATE
+    assert decide(False, False, 299, 0, False, 300) is None and decide(False, False, 300, 0, False, 300) == "start"
+    assert decide(True, True, 0, 5, True, 300) == "stop" and decide(False, True, 0, 0, False, 300) is None
+    assert decide(True, False, 900, RETRY, False, 300) == "retry" and decide(True, False, 900, RETRY - 1, False, 300) \
+        is None
+    assert decide(True, False, 900, RETRY * 3, True, 300) is None  # never while someone is joined
+    assert ssid("tv-lobby-01") == "tvlink-tv-lobby-01" and len(ssid("x" * 63)) == 32
+    pws = {password() for _ in range(50)}
+    assert len(pws) == 50 and all(len(p) == 14 and set(p) <= set(CHARS + "-") and p.count("-") == 2 for p in pws)
+    assert connected("default via 192.0.2.1 dev wlan0\n", "")
+    assert not connected("", "lo:loopback:activated\ntvlink-hotspot:802-11-wireless:activated\n")
+    assert not connected("", "tvlink-wifi1:802-11-wireless:activating\n")  # still trying, eg a wrong password
+    assert connected("", "Site\\: LAN:802-3-ethernet:activated\n") and not connected("", "garbled\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        STATE = os.path.join(tmp, "state")
+        save("tvlink-tv-lobby-01", "abcd-efgh-jkmn")
+        with open(STATE) as f:
+            assert f.read() == "tvlink-tv-lobby-01\nabcd-efgh-jkmn\nhttp://10.42.0.1\n"
+        assert os.stat(STATE).st_mode & 0o777 == 0o644
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["test"]:
+        test()
+    elif len(sys.argv) == 1:
+        main()
+    else:
+        sys.exit(__doc__)

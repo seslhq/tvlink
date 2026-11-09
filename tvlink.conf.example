@@ -71,6 +71,10 @@ WIFI1_SSID=
 WIFI1_PSK=
 WIFI2_SSID=
 WIFI2_PSK=
+# 1 = after HOTSPOT_MIN minutes with no network, a Wi-Fi hotspot (tvlink-<hostname>, a new password each time, both on
+# the TV) to reach the console at http://10.42.0.1 from a phone and set the Wi-Fi; it stops once the unit is online.
+HOTSPOT=0
+HOTSPOT_MIN=5
 
 # Blank: install upgrades every night (canary units). Mon, Tue, Wed, Thu, Fri, Sat or Sun, spelled exactly so: weekly,
 # days after the canaries; anything else counts as blank. Edit here, then rerun install.sh: tvlink set and a reboot

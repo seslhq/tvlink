@@ -675,5 +675,71 @@ out=$(ro tvlink override on 30m); check "... an override says it won't last" say
 check "... and is gone with the overlay" test "$(tvlink override)" = none
 command rm -rf "$o"
 
+echo "== Setup hotspot (hwsim: the unit's Wi-Fi loses its network; wlan2 in the ap namespace is a phone)"
+client_off() { # the phone leaves; wlan2 is the hidden network's access point again
+  local pid
+  pid=$(cat /run/tvlink-test-phone.pid 2>/dev/null) && kill "$pid" 2>/dev/null
+  [ -z "$pid" ] || within 10 no kill -0 "$pid" 2>/dev/null # wlan2 free again before hostapd takes it
+  command rm -f /run/tvlink-test-phone.pid
+  ip netns exec ap ip addr flush dev wlan2
+  ip netns exec ap ip addr add 198.51.100.1/24 dev wlan2
+  kill -0 "$(cat /run/ap2.pid 2>/dev/null)" 2>/dev/null ||
+    ip netns exec ap hostapd -B -P /run/ap2.pid /run/ap2.conf >/dev/null
+}
+client_off # left by an earlier run
+hotspot_up() { nmcli -t -f NAME connection show --active | grep -qx tvlink-hotspot; }
+hs() { python3 -c 'import json, sys
+t = open("/run/tvlink/status.js").read()
+print((json.loads(t[t.index("(") + 1:t.rindex(")")])["hotspot"] or {}).get(sys.argv[1], ""))' "$1"; }
+web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-hotspot >/dev/null
+web -H "X-CSRF-Token: $t" -d '{"name": "vm-hotspot"}' /api/tokens >/dev/null
+token=$(field token)
+since=$(date '+%F %T')
+nic=$(ip -4 route show default | awk '$5 !~ /^wl/ {print $5; exit}')
+tvlink set HOTSPOT=1 HOTSPOT_MIN=1 WIFI1_SSID=tvlink-gone WIFI2_SSID= WIFI2_PSK= >/dev/null
+ip route del default dev "$nic" # and Ethernet out
+check "no network: the hotspot starts after HOTSPOT_MIN" within 150 hotspot_up
+check "... named after the host" test "$(iw dev wlan0 info | sed -n 's/^[[:space:]]*ssid //p')" = "tvlink-$(hostname)"
+check "... WPA2" test "$(nmcli -g 802-11-wireless-security.key-mgmt connection show tvlink-hotspot)" = wpa-psk
+hs_is() { [ "$(hs ssid)" = "$1" ]; }
+check "... in status.js for the splash" within 70 hs_is "tvlink-$(hostname)"
+ssid=$(hs ssid) psk=$(hs password)
+check "... a new password, 12 characters" grep -qE '^[a-z2-9]{4}-[a-z2-9]{4}-[a-z2-9]{4}$' <<<"$psk"
+check "... and the console's address" test "$(hs url)" = http://10.42.0.1
+web /wifi >/dev/null
+check "... the console's Wi-Fi page shows them" grep -q "$psk" "$c/body"
+systemctl stop tvlink-test-board
+systemctl restart tvlink
+bar() { tvlink screenshot >/dev/null 2>&1 && near "$(img /run/tvlink/screen.jpg 960 62)" f4f6f8; }
+check "... across the top of the splash" within 60 bar
+systemd-run -q --unit tvlink-test-board python3 -m http.server 8080 --bind 127.0.0.1 --directory /run/board
+kill "$(cat /run/ap2.pid)" && sleep 1
+printf 'ctrl_interface=/run/tvlink-test-wpa\nnetwork={\n ssid="%s"\n psk="%s"\n key_mgmt=WPA-PSK\n proto=RSN\n}\n' \
+  "$ssid" "$psk" >/run/tvlink-test-phone.conf
+ip netns exec ap ip addr flush dev wlan2
+ip netns exec ap wpa_supplicant -B -i wlan2 -c /run/tvlink-test-phone.conf -P /run/tvlink-test-phone.pid >/dev/null
+phone_joined() { ip netns exec ap iw dev wlan2 link | grep -q "SSID: $ssid"; }
+check "a phone joins with the password from status.js" within 30 phone_joined
+# Once, in the foreground, keeping the address, with no hooks (they would rewrite the VM's own resolv.conf)
+ip netns exec ap dhcpcd -1 -4 -p -B -f /dev/null -c /bin/true -t 30 wlan2 >/dev/null 2>&1
+phone_addr() { ip netns exec ap ip -4 addr show wlan2 | grep -q 'inet 10[.]42[.]0[.]'; }
+check "... gets an address from it" phone_addr
+check "... and reaches the console's login page" test "$(ip netns exec ap curl -s -m 10 -o /dev/null -w '%{http_code}' \
+  http://10.42.0.1/login)" = 200
+# The working network through the console, over the hotspot: the hotspot makes way, so the answer may not arrive
+ip netns exec ap curl -s -m 20 -o /dev/null -H "Authorization: Bearer $token" -d '{"WIFI1_SSID": "tvlink-open"}' \
+  http://10.42.0.1/api/settings
+check "a working network set through it: the hotspot stops" within 30 no hotspot_up
+check "... the unit joins it" within 90 on_wifi tvlink-wifi1
+check "... the splash forgets it" within 70 hs_is ""
+check "the password is in no log" quiet test "$(journalctl -q --since "$since" | grep -c -F "$psk")" = 0
+check "tvlink's logs don't name the network" quiet test "$(journalctl -q --since "$since" -u tvlink-hotspot -t tvlink \
+  | grep -c -F "$ssid")" = 0
+client_off
+command rm -f /run/tvlink-test-phone.conf
+web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-hotspot >/dev/null
+tvlink set HOTSPOT=0 HOTSPOT_MIN=5 WIFI2_SSID=tvlink-hidden WIFI2_PSK=correct-horse-2 >/dev/null
+networkctl reconfigure "$nic"
+
 echo "== $fails failed"
 [ "$fails" = 0 ]

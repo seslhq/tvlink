@@ -14,7 +14,7 @@ CONTENT=${TVLINK_CONTENT:-/boot/firmware/tvlink}
 # with no POWER_METHOD means none.
 KEYS="BOARD_URL SOURCE SLIDE_SECONDS FIT POWER_MODE TV_ON TV_OFF IDLE_MIN MOTION_PIN POWER_METHOD IR_CODES IR_TX_PIN"
 KEYS+=" IR_RX_PIN RESOLUTION HDMI_FORCE_HOTPLUG OVERLAY_CORNER WIFI_COUNTRY WIFI1_SSID WIFI1_PSK WIFI2_SSID WIFI2_PSK"
-KEYS+=" TUNNEL_TOKEN USB_CONTENT CONTENT_URL CONTENT_SYNC_MIN LAST_GOOD BROWSER_RESTART"
+KEYS+=" HOTSPOT HOTSPOT_MIN TUNNEL_TOKEN USB_CONTENT CONTENT_URL CONTENT_SYNC_MIN LAST_GOOD BROWSER_RESTART"
 # shellcheck disable=SC2034
 WIFI_COUNTRY='' WIFI1_SSID='' WIFI1_PSK='' WIFI2_SSID='' WIFI2_PSK='' TUNNEL_TOKEN=''
 # The tunnel's token lives here, root only, never in the conf on the FAT card: it is a key to the unit's console.
@@ -29,6 +29,7 @@ USB=${TVLINK_USB:-/run/tvlink-usb}              # a USB stick, mounted read-only
 SYNC=${TVLINK_SYNC:-/var/lib/tvlink/content}    # synced content (CONTENT_URL): current links to the live set
 SYNC_STATE=/run/tvlink-content/state.json       # the last sync's result, from tvlink-content
 LAST=${TVLINK_LAST:-/var/lib/tvlink/last.jpg}   # the last good screen (LAST_GOOD=1): root's copy of the kiosk's
+HOTSPOT_STATE=${TVLINK_HOTSPOT_STATE:-/run/tvlink-hotspot/state} # the setup hotspot's name, password, address
 # shellcheck disable=SC2034 # defaults; some are only read through ${!k} in show
 BOARD_URL='' SOURCE=auto SLIDE_SECONDS=10 FIT=contain POWER_MODE=schedule TV_ON=06:00 TV_OFF=22:00 IDLE_MIN=15
 # shellcheck disable=SC2034
@@ -36,7 +37,7 @@ MOTION_PIN=17 CEC=1 RESOLUTION=1920x1080@60 UPDATE_DAY='' OVERLAY_CORNER=bottom-
 # shellcheck disable=SC2034
 IR_CODES=learned IR_TX_PIN=18 IR_RX_PIN=23 HDMI_FORCE_HOTPLUG=0
 # shellcheck disable=SC2034
-USB_CONTENT=0 CONTENT_URL='' CONTENT_SYNC_MIN=15 LAST_GOOD=0 BROWSER_RESTART=''
+USB_CONTENT=0 CONTENT_URL='' CONTENT_SYNC_MIN=15 LAST_GOOD=0 BROWSER_RESTART='' HOTSPOT=0 HOTSPOT_MIN=5
 for k in $KEYS; do printf -v "DEF_$k" %s "${!k}"; done # defaults, for tvlink keys
 # shellcheck disable=SC2034 # read through ${!d} in keys
 DEF_POWER_METHOD=cec
@@ -67,6 +68,9 @@ WIFI1_SSID|text|Network 1|Wi-Fi network name. Hidden networks work.
 WIFI1_PSK|secret|Password 1|Blank: an open network.
 WIFI2_SSID|text|Network 2|A second network, eg the next one when the site changes its Wi-Fi.
 WIFI2_PSK|secret|Password 2|Blank: an open network.
+HOTSPOT|0 1|Setup Hotspot|1: after Hotspot Minutes with no network, a Wi-Fi hotspot to reach the console from a \
+phone; its name and password show on the TV.
+HOTSPOT_MIN|number|Hotspot Minutes|Minutes with no network before the setup hotspot starts.
 TUNNEL_TOKEN|secret|Tunnel Token|Cloudflare Tunnel token for this unit. Kept on the unit, not the SD card. Clear: off.
 USB_CONTENT|0 1|USB Content|1: a USB stick with a tvlink folder plays like local content, ahead of the rest.
 CONTENT_URL|url|Content URL|https link to a manifest of files to sync and play as local content. Blank: off.
@@ -129,6 +133,8 @@ check_conf() {
   [[ $CONTENT_SYNC_MIN =~ ^[1-9][0-9]{0,3}$ ]] || CONTENT_SYNC_MIN=15
   [[ $LAST_GOOD =~ ^[01]$ ]] || LAST_GOOD=0
   [[ $BROWSER_RESTART =~ ^(([01][0-9]|2[0-3]):[0-5][0-9])?$ ]] || BROWSER_RESTART=''
+  [[ $HOTSPOT =~ ^[01]$ ]] || HOTSPOT=0
+  [[ $HOTSPOT_MIN =~ ^[1-9][0-9]{0,3}$ ]] || HOTSPOT_MIN=5
 }
 check_conf
 
@@ -176,16 +182,18 @@ keys() {
 STATUS=${TVLINK_STATUS:-/run/tvlink/status.js}
 CLAIM=${TVLINK_CLAIM:-/run/tvlink-console/claim} # the console's claim code, there until a password is set
 put_status() { # state [http code] [files json] [source]
-  local host=${BOARD_URL#*://} url=${BOARD_URL//\\/\\\\} claim='' last=0
+  local host=${BOARD_URL#*://} url=${BOARD_URL//\\/\\\\} claim='' last=0 hs=null ssid psk at
   read -r claim 2>/dev/null <"$CLAIM"
+  { read -r ssid && read -r psk && read -r at; } 2>/dev/null <"$HOTSPOT_STATE" &&
+    hs="{\"ssid\":$(js "$ssid"),\"password\":$(js "$psk"),\"url\":$(js "$at")}"
   [ "$LAST_GOOD" != 1 ] || last=$(stat -c %Y "$LAST" 2>/dev/null) || last=0
   host=${host%%[/?#]*} host=${host##*@} url=${url//\"/\\\"}
   printf 'tvlink({"state":"%s","code":"%s","host":"%s","url":"%s","name":"%s","ip":"%s","version":"%s",' \
     "$1" "${2:-}" "${host//[\"\\]/}" "$url" "$(hostname)" "$(hostname -I 2>/dev/null | cut -d' ' -f1)" "$VERSION" \
     >"$STATUS.tmp" &&
-    printf '"files":[%s],"source":"%s","secs":%d,"fit":"%s","claim":"%s","last":%d,"corner":"%s"})\n' "${3:-}" \
-      "${4:-}" "$SLIDE_SECONDS" "${FIT//[^a-z]/}" "${claim//[^A-Z0-9-]/}" "$last" "${OVERLAY_CORNER//[^a-z-]/}" \
-      >>"$STATUS.tmp" &&
+    printf '"files":[%s],"source":"%s","secs":%d,"fit":"%s","claim":"%s","last":%d,"corner":"%s","hotspot":%s})\n' \
+      "${3:-}" "${4:-}" "$SLIDE_SECONDS" "${FIT//[^a-z]/}" "${claim//[^A-Z0-9-]/}" "$last" \
+      "${OVERLAY_CORNER//[^a-z-]/}" "$hs" >>"$STATUS.tmp" &&
     mv "$STATUS.tmp" "$STATUS"
 }
 
@@ -216,6 +224,7 @@ content() {
 # files show and a stick pulled out stops playing; rereads the settings too, so a new BOARD_URL needs no restart.
 status_loop() {
   local delay=2 src files state last='' seen=0 url now t
+  snapshot() { content; cat "$HOTSPOT_STATE" 2>/dev/null; } # what the splash shows besides the state
   while :; do
     { read -r src; read -r files; } < <(content)
     if [ "$SOURCE" != folder ] && [ -n "$BOARD_URL" ] && board_up; then state=ready code='' seen=1
@@ -227,13 +236,13 @@ status_loop() {
     fi
     put_status "$state" "$code" "$files" "$src"
     if [ "$state $code" != "$last" ]; then echo "Splash: $state $code"; last="$state $code"; fi
-    url=$BOARD_URL now=$src$'\n'$files
+    url=$BOARD_URL now=$(snapshot)
     for ((t = 0; t < delay; t += 2)); do
       sleep 2
       [ -r "$CONF" ] && read_conf 2>/dev/null
       check_conf 2>/dev/null
       [ "$BOARD_URL" = "$url" ] || { seen=0 delay=1; break; } # a new link: probe it now
-      [ "$(content)" = "$now" ] || break
+      [ "$(snapshot)" = "$now" ] || break
     done
     # Once the board has answered, keep probing every minute: the badge and any return to the splash use it.
     delay=$((seen ? 60 : delay * 2 > 30 ? 30 : delay * 2))
@@ -546,6 +555,8 @@ doctor() {
   done
   echo "Wi-Fi: $(nmcli -t -f NAME connection show --active 2>/dev/null | paste -sd' ' -)," \
     "$(iw dev wlan0 get power_save 2>/dev/null)"
+  [ "$HOTSPOT" = 0 ] ||
+    echo "Setup hotspot: $([ -s "$HOTSPOT_STATE" ] && echo on || echo "off until $HOTSPOT_MIN min with no network")"
   echo "Tunnel: $(tunnel_state)"
   echo "Watchdog: $(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null), read-only root $(overlay status \
     2>/dev/null)"
@@ -796,7 +807,8 @@ logs() {
   local args
   case ${1:-} in
     kiosk) args=(-t tvlink) ;; # the kiosk's lines come from its login session
-    power | net) args=(-u "tvlink-$1") ;;
+    power) args=(-u tvlink-power) ;;
+    net) args=(-u tvlink-net -u tvlink-hotspot) ;;
     *) die "Usage: tvlink logs kiosk|power|net" ;;
   esac
   journalctl -q --no-pager -n 200 -o short-iso "${args[@]}"
@@ -844,7 +856,7 @@ board_switch() {
 set_conf() {
   [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink set KEY=value"
   [ $# -gt 0 ] || die "Usage: tvlink set KEY=value... (keys: $KEYS)"
-  local kv key value kiosk=0 net=0 power=0 boot=0 tunnel=- tx=$IR_TX_PIN rx=$IR_RX_PIN switch=0 usb=- sync=0
+  local kv key value kiosk=0 net=0 power=0 boot=0 tunnel=- tx=$IR_TX_PIN rx=$IR_RX_PIN switch=0 usb=- sync=0 hs=0
   for kv in "$@"; do # check every value before writing any
     key=${kv%%=*} value=${kv#*=}
     [[ $kv == *=* && $key =~ ^[A-Z0-9_]+$ && " $KEYS " == *" $key "* ]] || die "Unknown setting: $kv (keys: $KEYS)"
@@ -862,7 +874,8 @@ set_conf() {
       IR_TX_PIN | IR_RX_PIN) [[ $value =~ ^([2-9]|1[0-9]|2[0-7])$ || ($key == IR_RX_PIN && -z $value) ]] ||
         die "$key is a GPIO from 2 to 27 (BCM number); IR_RX_PIN may be blank: no receiver"
         if [ "$key" = IR_TX_PIN ]; then tx=$value; else rx=$value; fi ;;
-      HDMI_FORCE_HOTPLUG | USB_CONTENT | LAST_GOOD) [[ $value =~ ^[01]$ ]] || die "$key is 0 or 1" ;;
+      HDMI_FORCE_HOTPLUG | USB_CONTENT | LAST_GOOD | HOTSPOT) [[ $value =~ ^[01]$ ]] || die "$key is 0 or 1" ;;
+      HOTSPOT_MIN) [[ $value =~ ^[1-9][0-9]{0,3}$ ]] || die "HOTSPOT_MIN is 1 to 9999 minutes" ;;
       CONTENT_URL) [[ -z $value || $value =~ ^https://[^[:space:]]+$ ]] ||
         die "CONTENT_URL is an https link to a manifest, eg https://example.com/tvlink/manifest.json" ;;
       CONTENT_SYNC_MIN) [[ $value =~ ^[1-9][0-9]{0,3}$ ]] || die "CONTENT_SYNC_MIN is 1 to 9999 minutes" ;;
@@ -915,6 +928,7 @@ set_conf() {
       HDMI_FORCE_HOTPLUG | IR_TX_PIN | IR_RX_PIN) boot=1 ;;
       POWER_METHOD) power=1 boot=1 && rm -f "$SIGNAL" ;; # a new method starts with the signal on
       WIFI*) net=1 ;;
+      HOTSPOT*) hs=1 ;;
       *) power=1 ;;
     esac
   done
@@ -924,7 +938,8 @@ set_conf() {
   [ "$kiosk" = 1 ] || [ "$switch" = 0 ] || board_switch
   [ "$usb" = - ] || usb_apply "$usb"
   [ "$sync" = 0 ] || systemctl restart tvlink-content # it syncs at start, or with no CONTENT_URL removes what it had
-  [ "$net" = 0 ] || systemctl restart tvlink-net
+  [ "$net" = 0 ] || { systemctl restart tvlink-net && systemctl try-restart tvlink-hotspot; }
+  [ "$hs" = 0 ] || systemctl restart tvlink-hotspot
   [ "$tunnel" = - ] || { tunnel_set "$tunnel" && echo "TUNNEL_TOKEN=${tunnel:+(set)}"; }
 }
 

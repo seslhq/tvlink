@@ -12,6 +12,7 @@ python3 tvlink-power test
 python3 tvlink-agent test
 python3 tvlink-console test
 python3 tvlink-content test
+python3 tvlink-hotspot test
 ```
 
 The self-tests cover the settings parser (through `tvlink show`, including `CEC=0` as `POWER_METHOD=none`), the power
@@ -22,7 +23,8 @@ tokens, login rate limit (and the visitor's address through a tunnel), settings 
 the daily browser restart's timing (once on the day clocks go back, an hour late when they go forward, never in the
 first hour after boot or while dark); synced content's manifest checks, https-only redirects, and syncs against a
 stand-in server (only changed files fetched, the rest linked; a bad checksum, an oversized or missing file refused
-with the live set kept; older sets pruned) and `manifest`; and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each
+with the live set kept; older sets pruned) and `manifest`; the setup hotspot's start, stop and retry timing, its name and passwords, what counts as online, and
+the badge's setup line; and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each
 failure's message), the overview not waiting on a slow or dead unit, and its badges.
 
 ## The VM
@@ -51,6 +53,7 @@ tests/vm.sh
 | Boot partition | 512 MiB FAT32 loop image at `/boot/firmware` | |
 | TV on HDMI-CEC | `vivid`: its HDMI input is the TV, its output is the Pi, and `cec-follower` acts as the TV. The TV side's node is moved to `/dev/tvside`, so tvlink sees one adapter | `tv` in `tests/vm-test.sh` |
 | Site Wi-Fi | `mac80211_hwsim`: `wlan0` is the Pi's radio; two access points run in the `ap` network namespace: `tvlink-open` (open) and `tvlink-hidden` (hidden, WPA2) | `ip netns exec ap ...` |
+| A phone joining the setup hotspot | `wlan2` in the `ap` namespace (its access point stopped): `wpa_supplicant` and `dhcpcd` | `ip netns exec ap curl http://10.42.0.1/` |
 | Ethernet unplugged | `ip route del default dev eth0`; plug it back in with `networkctl reconfigure eth0` | |
 | IR LED, receiver and the TV's IR sensor | `rc-loopback`: what is sent on `/dev/lirc0` comes back on it, and the kernel's NEC and Sony decoders turn it into scancodes on its input device | `ir-ctl -d /dev/lirc0 -S nec:0x1234` (a remote) |
 | HDMI EDID | Apple's virtual display gives `Virtual-1` no EDID: a stand-in connector `/run/tvlink-test-drm/card1-HDMI-A-1` holds vivid's TV EDID | `TVLINK_DRM=...` |
@@ -123,6 +126,12 @@ tests/vm.sh
   saves the stand-in's byte for byte, adds `drm.edid_firmware` once and the file to the initramfs; `clear` removes
   all three; `tvlink doctor` shows both.
 
+- the setup hotspot: with `HOTSPOT_MIN=1`, the unit's Wi-Fi set to a network that isn't there and Ethernet's route
+  gone, the hotspot starts within a minute or so, named after the host, WPA2; status.js, the splash (across the top)
+  and the console's Wi-Fi page show its name and password; a phone (`wlan2` in the `ap` namespace) joins with the
+  password from status.js, gets an address from it and opens the console's login page; the working network set
+  through the console's API over the hotspot stops it, and the unit joins that network; the password is in no log.
+
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
 - **TV that acknowledges CEC but ignores it:** `pkill -x cec-follower; cec-ctl -d /dev/tvside --clear; cec-ctl -d
@@ -179,6 +188,11 @@ or after a change that touches them, check on the bench with a fresh card and re
   change; each ends on time and the mode takes over (`schedule` turns the TV back, `manual` leaves it).
 - Motion: a PIR wakes the TV outside on-hours and standby follows after `IDLE_MIN`; `manual+motion` wakes on arrival
   and leaves a TV switched off by hand alone.
+- Setup hotspot on a Pi 5 with `HOTSPOT=1`: the Wi-Fi router off for `HOTSPOT_MIN`: the TV shows the hotspot; an
+  iPhone and an Android phone join it, open `http://10.42.0.1` (the phone may warn the network has no internet: stay
+  on it) and claim or log in; setting the Wi-Fi there stops the hotspot and the unit joins; the router back on with no
+  one joined: the unit rejoins within about 10 min; `WIFI_COUNTRY` set and blank; `journalctl -b | grep <password>`
+  finds nothing.
 - `tvlink set WIFI2_SSID=... WIFI2_PSK=...` adds the network without a reboot, and the unit joins it when the first
   goes away.
 - With a keyboard: F12, Ctrl+Shift+I, Ctrl+O and Ctrl+S do nothing useful.

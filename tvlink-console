@@ -43,6 +43,7 @@ _mode = "fleet" if FLEET else "console"
 STATE = os.environ.get("TVLINK_CONSOLE_STATE", f"/var/lib/tvlink-{_mode}")  # password, tokens or units: ours only
 RUN = os.environ.get("TVLINK_CONSOLE_RUN", f"/run/tvlink-{_mode}")  # the claim code, read by the splash on a unit
 STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
+HOTSPOT = os.environ.get("TVLINK_HOTSPOT_STATE", "/run/tvlink-hotspot/state")  # name, password, address; while up
 PORT = int(os.environ.get("TVLINK_CONSOLE_PORT", "8080" if FLEET else "80"))
 ADDR = os.environ.get("TVLINK_CONSOLE_ADDR", "127.0.0.1" if FLEET else "::")  # the fleet: only its tunnel reaches it
 SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
@@ -314,8 +315,14 @@ def status(brief=False):
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
             "tv": tv or "unknown", "method": power_method(sch), "tunnel": tunnel or "unknown", "uptime": uptime(),
             "content": content_label(s), "sync": sync or "unknown", "override": held or "unknown",
-            "overlay": ro or "unknown",
+            "overlay": ro or "unknown", "hotspot": hotspot(),
             "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
+
+
+def hotspot(path=None):
+    """The setup hotspot while it is up: {ssid, password, url}; else None."""
+    lines = (read_file(path or HOTSPOT) or "").splitlines()
+    return dict(zip(("ssid", "password", "url"), lines)) if len(lines) >= 3 else None
 
 
 def content_label(s):
@@ -524,7 +531,7 @@ class Remote:
         SEEN[self.name] = {"time": time.time(), "status": s}
         return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
                 "tv": "unknown", "tunnel": "", "content": "", "sync": "", "override": "unknown",
-                "overlay": "unknown", "uptime": 0,
+                "overlay": "unknown", "uptime": 0, "hotspot": None,
                 "health": [], "screenshot": None,
                 **s}
 
@@ -794,7 +801,7 @@ def settings_form(keys, sess, action, form=None, error="", error_at=None, extra=
 
 
 def page_keys(sch, wifi):
-    return [k for k in sch.get("keys", []) if k["key"].startswith("WIFI") == wifi]
+    return [k for k in sch.get("keys", []) if k["key"].startswith(("WIFI", "HOTSPOT")) == wifi]
 
 
 # HTTP
@@ -1056,6 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
                 ("TV", e(tv)), ("Override", e(cap(s.get("override", "")))),
                 ("Tunnel", e(s.get("tunnel", "").capitalize())), ("Read-Only Root", e(cap(s.get("overlay", "")))),
+                ("Setup Hotspot", e(f'On: {s["hotspot"]["ssid"]}' if isinstance(s.get("hotspot"), dict) else "Off")),
                 ("Local Content", e(s.get("content") or "None")), ("Content Sync", e(cap(s.get("sync", "")))),
                 ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
@@ -1095,6 +1103,13 @@ class Handler(BaseHTTPRequestHandler):
                     f'<th>Security</th></tr></thead><tbody>{rows}</tbody></table></section>')
             intro = ("<p>Up to two networks, besides the one set in Imager. Changes apply at once; a unit on Wi-Fi "
                      "may drop off for a moment.</p>")
+            hs = self.unit.status(brief=True).get("hotspot")
+            if isinstance(hs, dict):
+                intro += (f'<section><p>The setup hotspot is on: network <strong>{e(hs.get("ssid", ""))}</strong>, '
+                          f'password <strong class="secret">{e(hs.get("password", ""))}</strong>, console '
+                          f'{e(hs.get("url", ""))}. Saving a network stops it while the unit tries to join; if it '
+                          f"can't, the hotspot comes back within {e(self.hotspot_min(sch))} minutes with a new "
+                          f"password on the TV.</p></section>")
         else:
             intro = "<p>Saved to tvlink.conf on the SD card; the parts that use a setting restart by themselves.</p>"
         if sch.get("error"):
@@ -1102,6 +1117,10 @@ class Handler(BaseHTTPRequestHandler):
         form_html = settings_form(keys, self.sess, self.base + path, form, error, at, extra)
         self.reply(400 if bad and method == "POST" else 200,
                    self.page(title, intro + form_html + body, path, flash, bad))
+
+    @staticmethod
+    def hotspot_min(sch):
+        return next((k.get("value") for k in sch.get("keys", []) if k.get("key") == "HOTSPOT_MIN"), "") or "5"
 
     def wifi_page(self, method, form):
         self.settings_page(method, form, wifi=True)
@@ -1412,6 +1431,12 @@ def test():
     assert content_label({"source": "usb", "files": ["/run/tvlink-usb/tvlink/a.png"]}) == "USB stick, 1 file"
     assert content_label({"source": "synced", "files": ["a.png", "b.mp4"]}) == "Synced, 2 files"
     assert content_label({"source": "", "files": []}) == "None" and content_label({}) == "None"
+    with tempfile.TemporaryDirectory() as tmp:  # the setup hotspot, as tvlink-hotspot writes it
+        with open(os.path.join(tmp, "state"), "w") as f:
+            f.write("tvlink-tv-lobby-01\nabcd-efgh-jkmn\nhttp://10.42.0.1\n")
+        assert hotspot(os.path.join(tmp, "state")) == {"ssid": "tvlink-tv-lobby-01", "password": "abcd-efgh-jkmn",
+                                                       "url": "http://10.42.0.1"}
+        assert hotspot(os.path.join(tmp, "none")) is None
     # Rate limit: per client, then for everyone, and the window slides
     lim = Limiter(3, 60)
     for _ in range(3):

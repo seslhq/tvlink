@@ -14,7 +14,7 @@ CONF=$BOOT/tvlink.conf
 apt-get update
 # --no-upgrade: installed packages update on the unattended-upgrades schedule, and a held one does not stop this.
 apt-get install -y --no-upgrade cage wlr-randr chromium v4l-utils unattended-upgrades curl python3-gpiozero \
-  python3-lgpio sudo
+  python3-lgpio sudo dnsmasq-base # dnsmasq: addresses for the setup hotspot (NetworkManager's shared mode)
 
 # Daily security updates, plus the Raspberry Pi repo that ships Chromium, and Cloudflare's for cloudflared on units
 # with a tunnel (tvlink set TUNNEL_TOKEN adds it).
@@ -44,10 +44,10 @@ id tvlink-console >/dev/null 2>&1 || useradd --system -M -d /nonexistent -s /usr
 visudo -cqf tvlink-console.sudoers || { echo "tvlink-console.sudoers does not parse" >&2; exit 1; }
 install -m 440 tvlink-console.sudoers /etc/sudoers.d/tvlink-console
 
-install -m 755 tvlink tvlink-power tvlink-agent tvlink-console tvlink-content /usr/local/bin/
+install -m 755 tvlink tvlink-power tvlink-agent tvlink-console tvlink-content tvlink-hotspot /usr/local/bin/
 install -m 644 tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.service tvlink-reboot.timer \
   tvlink-console.service tvlink-tunnel.service tvlink-content.service tvlink-usb@.service tvlink-lastgood.service \
-  tvlink-lastgood.timer /etc/systemd/system/
+  tvlink-lastgood.timer tvlink-hotspot.service /etc/systemd/system/
 # USB sticks go to tvlink-usb@ (USB_CONTENT); /var/lib/tvlink holds synced content and the last good screen, which
 # the kiosk reads.
 install -m 644 90-tvlink-usb.rules /etc/udev/rules.d/
@@ -102,10 +102,10 @@ chmod 755 /etc/initramfs-tools/hooks/tvlink-edid
 
 systemctl daemon-reload
 systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer tvlink-console.service \
-  tvlink-content.service tvlink-lastgood.timer
+  tvlink-content.service tvlink-lastgood.timer tvlink-hotspot.service
 # An update takes effect now; a first install starts at the next boot, except the console, so it can be claimed now.
 systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service tvlink-tunnel.service \
-  tvlink-content.service
+  tvlink-content.service tvlink-hotspot.service
 systemctl restart tvlink-console.service
 
 echo "Installed tvlink $(./tvlink show | sed -n 's/^VERSION=//p'). First install: set BOARD_URL if needed, then reboot."

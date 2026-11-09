@@ -1,0 +1,21 @@
+# tvlink setup hotspot (HOTSPOT=1): after HOTSPOT_MIN minutes with no network, a Wi-Fi access point for the console,
+# its name and password on the TV. tvlink set restarts it (a Wi-Fi change: try the networks now); stopping it, or
+# HOTSPOT=0, takes the hotspot down.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink setup hotspot after HOTSPOT_MIN minutes with no network
+After=NetworkManager.service tvlink-net.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/bin/tvlink-hotspot
+ExecStopPost=/bin/sh -c 'nmcli connection delete tvlink-hotspot >/dev/null 2>&1; true'
+# The name, password and address, for the splash, the badge and the console; gone when it stops.
+RuntimeDirectory=tvlink-hotspot
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

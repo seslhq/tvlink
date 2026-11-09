@@ -175,6 +175,15 @@ def badge(status, last_ok, net, page_status, clock):
     return "live", f"{net} {shown}".strip()
 
 
+def setup_text(status):
+    """The setup hotspot's name, password and console address (HOTSPOT=1), for the badge while offline; or empty.
+    Shown, never logged."""
+    h = status.get("hotspot")
+    if not isinstance(h, dict) or not h.get("ssid"):
+        return ""
+    return f" · Wi-Fi setup: join {h['ssid']}, password {h.get('password', '')}, then open {h.get('url', '')}"
+
+
 def uptime(path=UPTIME):
     try:
         with open(path) as f:
@@ -423,7 +432,9 @@ def run(argv, conf):
             if (level, text.rstrip("0123456789:-")) != shown:  # log changes of state, not every new time
                 print(f"Badge: {level} {text}", flush=True)
                 shown = (level, text.rstrip("0123456789:-"))
-            state = json.dumps({"level": level, "text": text, "corner": corner})
+            setup = setup_text(status) if level == "bad" else ""  # offline long enough: how to set it up
+            state = json.dumps({"level": level, "text": text + setup,
+                                "corner": "bottom-right" if setup and corner == "off" else corner})
             try:
                 browser.send("Runtime.evaluate", {"expression": f"window.__tvlinkOverlay?.({state})",
                                                   "returnByValue": True}, session)
@@ -473,6 +484,10 @@ def test():
     assert badge({"state": "waiting", "code": "503"}, "10:30", "Wi-Fi", 200, True) == ("warn", "Cached 10:30")
     assert badge(live, "10:42", "Wired", 404, True) == ("warn", "Board not found")
     assert badge({"state": "folder"}, "10:30", "Wired", 200, True) == ("bad", "Offline, showing 10:30")
+    hs = {"ssid": "tvlink-tv-lobby-01", "password": "abcd-efgh-jkmn", "url": "http://10.42.0.1"}
+    assert setup_text({"hotspot": hs}) == (" · Wi-Fi setup: join tvlink-tv-lobby-01, password abcd-efgh-jkmn, then "
+                                           "open http://10.42.0.1")
+    assert setup_text({"hotspot": None}) == setup_text({}) == setup_text({"hotspot": "x"}) == ""
     assert badge({"state": "folder", "code": "503"}, "10:30", "Wired", 200, True) == ("warn", "Cached 10:30")
     assert badge({"state": "network"}, "10:30", "", 404, True)[0] == "bad"  # Offline beats Board not found
     assert badge(live, "10:42", "Wired", 200, False) == ("warn", "Clock not set")
