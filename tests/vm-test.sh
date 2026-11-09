@@ -24,6 +24,22 @@ on_wifi() { nmcli -t -f DEVICE,STATE,CONNECTION device | grep -qx "wlan0:connect
 logged() { journalctl -q -t tvlink --since "$since" | grep "$1" >/dev/null; } # kiosk lines come from its login session
 power_said() { journalctl -q -u tvlink-power --since "$since" | grep -q "$1"; }
 hm() { date -d "$1" +%H:%M; } # eg hm '+1 hour'
+cmdlines() { # file: every distinct command line on the system, one a line, until killed (a fast loop over /proc)
+  exec python3 -c 'import glob, sys, time
+seen = set()
+with open(sys.argv[1], "wb", buffering=0) as out:
+    while True:
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(p, "rb") as f:
+                    c = f.read().replace(b"\0", b" ").strip()
+            except OSError:
+                continue
+            if c and c not in seen:
+                seen.add(c)
+                out.write(c + b"\n")
+        time.sleep(0.002)' "$1"
+}
 
 echo "== Install and self-tests"
 command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf # left by an earlier run
@@ -218,14 +234,37 @@ nmcli -w 60 connection up tvlink-wifi1 >/dev/null # back as it was, for a rerun
 
 echo "== Kiosk"
 mkdir -p /run/board
-echo '<!doctype html><title>Board</title><body style="background:#123;color:#fff;font:80px sans-serif">BOARD' \
-  >/run/board/index.html
+# The board's own script (or a third party's on it) tries to reach the badge and identify: tvlink's global, and the
+# shadow roots they make. It reports what it sees, when that changes, as a request to the board's server.
+cat >/run/board/index.html <<'EOF'
+<!doctype html><title>Board</title><body style="background:#123;color:#fff;font:80px sans-serif">BOARD<script>
+const roots = [], attach = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function (o) { const r = attach.call(this, o); roots.push(r); return r; };
+let said = "";
+setInterval(() => {
+  const seen = `fn=${typeof window.__tvlinkOverlay}&badge=${+!!document.querySelector("tvlink-overlay")}` +
+    `&identify=${+!!document.querySelector("tvlink-identify")}&roots=${roots.length}`;
+  if (seen !== said) fetch("/probe?" + (said = seen)).catch(() => {});
+}, 1000);
+</script>
+EOF
 systemctl -q is-active tvlink-test-board ||
   systemd-run -q --unit tvlink-test-board python3 -m http.server 8080 --bind 127.0.0.1 --directory /run/board
 since=$(date '+%F %T')
 tvlink set BOARD_URL=http://127.0.0.1:8080/ >/dev/null
 check "splash hands over to the board" within 60 logged 'Splash: ready'
 check "badge shows live" within 60 logged 'Badge: live'
+probe() { journalctl -q -u tvlink-test-board --since "$since" | grep -qF "GET /probe?$1 "; }
+check "... on the page, out of its scripts' reach" within 30 probe 'fn=undefined&badge=1&identify=0&roots=0'
+tvlink identify >/dev/null
+check "identify: on the page, out of its scripts' reach" within 15 probe 'fn=undefined&badge=1&identify=1&roots=0'
+tvlink reload >/dev/null # identify off again
+out=$(tvlink set BOARD_URL=$'http://127.0.0.1:8080/\x01' 2>&1); check "a BOARD_URL with a control character refused" \
+  says 'BOARD_URL is an http'
+printf 'BOARD_URL=http://127.0.0.1:8080/\x7f\n' >/run/tvlink-test.conf
+check "... and ignored in a hand-edited conf" grep -qx 'BOARD_URL=' <(TVLINK_CONF=/run/tvlink-test.conf tvlink show \
+  2>/dev/null)
+command rm -f /run/tvlink-test.conf
 out=$(tvlink screenshot); check "screenshot" says Saved
 cage=$(pgrep -u kiosk -o -x cage)
 check "kiosk runs with only the render group" grep -qE '^Groups:\s+[0-9]+ [0-9]+ ?$' "/proc/$cage/status"
@@ -270,6 +309,8 @@ check "API with neither session nor token is refused" \
   test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/api/status)" = 401
 check "the console user can't run other commands as root" \
   quiet test "$(runuser -u tvlink-console -- sudo -n /usr/local/bin/tvlink show >/dev/null 2>&1; echo $?)" != 0
+check "... nor tvlink set with settings as arguments (stdin only)" quiet test "$(runuser -u tvlink-console -- \
+  sudo -n /usr/local/bin/tvlink set OVERLAY_CORNER=top-left >/dev/null 2>&1; echo $?)" != 0
 web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-test >/dev/null # left by an earlier run
 web -H "X-CSRF-Token: $t" -d '{"name": "vm-test"}' /api/tokens >/dev/null
 token=$(field token)
@@ -290,6 +331,28 @@ web /api/settings >/dev/null
 check "... the API reads it back" grep -qx top-left <(python3 -c 'import json, sys
 print(next(k["value"] for k in json.load(open(sys.argv[1]))["keys"] if k["key"] == "OVERLAY_CORNER"))' "$c/body")
 check "... and sudo did not log the command" quiet test "$(journalctl -q --since "$since" | grep -c OVERLAY_CORNER)" = 0
+# shellcheck disable=SC2016 # literally: what systemd-run expands unless told not to
+dollars='$$x${X}'
+out=$(runuser -u tvlink-console -- sudo -n /usr/local/bin/tvlink update "https://127.0.0.1:9/$dollars" \
+  "$(printf %064d 0)" 2>&1)
+check "console's tvlink: arguments as given, \$ and all" grep -qF "Download failed: https://127.0.0.1:9/$dollars" \
+  <<<"$out"
+printf 'WIFI2_PSK=pa%s\n' "$dollars" | runuser -u tvlink-console -- sudo -n /usr/local/bin/tvlink set --stdin >/dev/null
+check "... and settings on stdin saved as given" grep -qxF "WIFI2_PSK='pa$dollars'" /boot/firmware/tvlink.conf
+vpsk=" vm \\psk\$\$ $RANDOM" # spaces, a backslash, dollars
+python3 -c 'import json, sys; print(json.dumps({"WIFI2_PSK": sys.argv[1]}))' "$vpsk" >"$c/psk.json" # on no line
+cmdlines "$c/cmdlines" &
+sampler=$!
+sleep 1
+check "API sets a Wi-Fi password" test "$(web -H "X-CSRF-Token: $t" --data-binary @"$c/psk.json" /api/settings)" = 200
+kill "$sampler" && wait "$sampler" 2>/dev/null
+check "... through tvlink set --stdin" grep -q 'tvlink set --stdin' "$c/cmdlines"
+check "... the password on no command line meanwhile (sudo, systemd-run, tvlink, nmcli)" \
+  quiet test "$(grep -cF -- "$vpsk" "$c/cmdlines")" = 0
+check "... NetworkManager has it as given" test "$(nmcli -s -g 802-11-wireless-security.psk connection show \
+  tvlink-wifi2)" = "${vpsk//\\/\\\\}"
+tvlink set WIFI2_PSK=correct-horse-2 >/dev/null
+command rm -f "$c/cmdlines" "$c/psk.json"
 check "API refuses a bad value, naming the key" test "$(web -H "X-CSRF-Token: $t" -d '{"OVERLAY_CORNER": "middle"}' \
   /api/settings)/$(field key)" = 400/OVERLAY_CORNER
 check "claimed: the code is gone from the splash" within 60 splash_claim ''
@@ -745,15 +808,21 @@ web -H "X-CSRF-Token: $t" -d '{"name": "vm-hotspot"}' /api/tokens >/dev/null
 token=$(field token)
 since=$(date '+%F %T')
 nic=$(ip -4 route show default | awk '$5 !~ /^wl/ {print $5; exit}')
+cmdlines "$c/cmdlines" &
+sampler=$!
 tvlink set HOTSPOT=1 HOTSPOT_MIN=1 WIFI1_SSID=tvlink-gone WIFI2_SSID= WIFI2_PSK= >/dev/null
 ip route del default dev "$nic" # and Ethernet out
 check "no network: the hotspot starts after HOTSPOT_MIN" within 150 hotspot_up
+kill "$sampler" && wait "$sampler" 2>/dev/null
 check "... named after the host" test "$(iw dev wlan0 info | sed -n 's/^[[:space:]]*ssid //p')" = "tvlink-$(hostname)"
 check "... WPA2" test "$(nmcli -g 802-11-wireless-security.key-mgmt connection show tvlink-hotspot)" = wpa-psk
 hs_is() { [ "$(hs ssid)" = "$1" ]; }
 check "... in status.js for the splash" within 70 hs_is "tvlink-$(hostname)"
 ssid=$(hs ssid) psk=$(hs password)
 check "... a new password, 12 characters" grep -qE '^[a-z2-9]{4}-[a-z2-9]{4}-[a-z2-9]{4}$' <<<"$psk"
+check "... given to nmcli in a file" grep -q 'nmcli -w 30 connection up tvlink-hotspot passwd-file ' "$c/cmdlines"
+check "... on no command line" quiet test "$(grep -cF -- "$psk" "$c/cmdlines")" = 0
+command rm -f "$c/cmdlines"
 check "... and the console's address" test "$(hs url)" = http://10.42.0.1
 web /wifi >/dev/null
 check "... the console's Wi-Fi page shows them" grep -q "$psk" "$c/body"

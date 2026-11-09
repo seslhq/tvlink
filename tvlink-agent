@@ -50,7 +50,10 @@ CLOCK_FLOOR = 1793491200  # 2026-11-01, as in tvlink-power
 TICK, PUSH, HEALTH, MODE = 1, 15, 30, 30  # seconds: event poll, badge refresh, page health check, HDMI mode check
 SHOT_EVERY, SETTLE = 600, 30  # LAST_GOOD: seconds between screenshots, and of a new page live before the first
 
-# Runs in every document before the page's own scripts; the agent fills it in with __tvlinkOverlay(state).
+# Runs in every document before the page's own scripts, in tvlink's own JavaScript world (WORLD): the page shares the
+# DOM but not its globals or prototypes, so it can't see the badge's text (the hotspot password), read identify's (the
+# claim code), or change either. The agent fills it in with __tvlinkOverlay(state).
+WORLD = "tvlink"
 OVERLAY = r"""(() => {
   if (location.protocol === "file:" || window !== window.top || window.__tvlinkOverlay) return;
   const css = `div { display: flex; align-items: center; gap: .5em; font: 600 max(14px, .85vw)/1.2 system-ui,
@@ -274,9 +277,16 @@ class Browser:
         session = self.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
         for method in ("Page.enable", "Inspector.enable"):  # no Runtime.enable: its console events are not needed
             self.send(method, session=session)
-        self.send("Page.addScriptToEvaluateOnNewDocument", {"source": OVERLAY}, session)
-        self.send("Runtime.evaluate", {"expression": OVERLAY}, session)
+        self.send("Page.addScriptToEvaluateOnNewDocument", {"source": OVERLAY, "worldName": WORLD}, session)
+        self.run(OVERLAY, session)  # the document already there
         return session
+
+    def run(self, expression, session):
+        """expression in tvlink's world of the page's current document (made the first time, kept after)."""
+        frame = self.send("Page.getFrameTree", session=session)["frameTree"]["frame"]["id"]
+        ctx = self.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": WORLD}, session)
+        return self.send("Runtime.evaluate", {"expression": expression, "contextId": ctx["executionContextId"],
+                                              "returnByValue": True}, session)
 
     def load(self, url, timeout=30):
         """(session, target id) of url, loaded in a new background tab; RuntimeError (the tab closed) if it fails to
@@ -362,8 +372,7 @@ def run(argv, conf):
                 name = f"{status.get('name') or socket.gethostname()}\n{status.get('ip') or ''}".strip()
                 if status.get("claim"):  # the unit console has no password yet
                     name += f"\nConsole code {status['claim']}"
-                browser.send("Runtime.evaluate", {"expression": IDENTIFY % json.dumps(name), "returnByValue": True},
-                             session)
+                browser.run(IDENTIFY % json.dumps(name), session)
             elif request in ("display on", "display off"):
                 next_mode = 0.0  # below, this tick
             if request:
@@ -436,8 +445,7 @@ def run(argv, conf):
             state = json.dumps({"level": level, "text": text + setup,
                                 "corner": "bottom-right" if setup and corner == "off" else corner})
             try:
-                browser.send("Runtime.evaluate", {"expression": f"window.__tvlinkOverlay?.({state})",
-                                                  "returnByValue": True}, session)
+                browser.run(f"window.__tvlinkOverlay?.({state})", session)
             except (queue.Empty, RuntimeError):
                 pass
         if (keep and now >= next_shot and now - live_at >= SETTLE and href.startswith("http") and page_status < 400
@@ -445,8 +453,7 @@ def run(argv, conf):
             next_shot, next_push = now + SHOT_EVERY, 0.0  # the badge back right after
             hide = json.dumps({"level": "live", "text": "", "corner": "off"})
             try:  # without the badge: the splash marks it Offline
-                browser.send("Runtime.evaluate", {"expression": f"window.__tvlinkOverlay?.({hide})",
-                                                  "returnByValue": True}, session)
+                browser.run(f"window.__tvlinkOverlay?.({hide})", session)
                 shot = browser.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80}, session)
                 with open(LAST + ".tmp", "wb") as f:
                     f.write(base64.b64decode(shot["data"]))

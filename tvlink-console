@@ -219,12 +219,12 @@ class Limiter:
 
 # The unit, through tvlink
 
-def tvlink(*args, root=True, timeout=90):
-    """(ok, stdout, stderr). A list of arguments, never a shell; root through sudo's fixed list."""
+def tvlink(*args, root=True, timeout=90, stdin=None):
+    """(ok, stdout, stderr). A list of arguments, never a shell; root through sudo's fixed list. stdin: text to send."""
     cmd = ([SUDO, "-n", CLI] if root else [CLI]) + list(args)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+                           **({"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}))
         return p.returncode == 0, p.stdout.strip(), p.stderr.strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "", str(e)
@@ -240,13 +240,17 @@ def schema():
 
 
 def save(changes):
-    """Set {KEY: value} with one `tvlink set`: (ok, message, key the message is about)."""
+    """Set {KEY: value} with one `tvlink set`: (ok, message, key the message is about). On stdin, one KEY=value a
+    line: secrets never go on a command line."""
     if not changes:
         return True, "Nothing changed", None
     for k, v in changes.items():
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", k) or not isinstance(v, str):
             return False, f"Unknown setting: {k}", None
-    ok, out, err = tvlink("set", *(f"{k}={v}" for k, v in changes.items()), timeout=300)  # a first tunnel: apt
+        if re.search(r"[\r\n]", v):
+            return False, f"Value for {k} can't contain a newline", k
+    ok, out, err = tvlink("set", "--stdin", stdin="".join(f"{k}={v}\n" for k, v in changes.items()),
+                          timeout=300)  # a first tunnel: apt
     if ok:
         return True, " ".join(["Saved."] + [line for line in out.splitlines() if line.startswith("Reboot")]), None
     msg = err or out or "Can't save"
@@ -257,26 +261,35 @@ def error_key(msg, keys):
     return next((k for k in keys if re.search(rf"(?<![A-Z0-9_]){k}(?![A-Z0-9_])", msg)), None)
 
 
-def read_status(path=STATUS):
+def kiosk_file(path, limit):
+    """(bytes, mtime) of a file in the kiosk's folder, at most limit bytes, or (None, None). Never through a link, and
+    a regular file only (not a FIFO that never ends)."""
     try:
-        with open(path, errors="replace") as f:
-            text = f.read().strip()
-        return json.loads(text[text.index("(") + 1:text.rindex(")")])
-    except (OSError, ValueError):
-        return {}
-
-
-def screen():
-    """(JPEG bytes, mtime) of the last screenshot, or (None, None). Never through a link: the folder is the kiosk's."""
-    try:
-        fd = os.open(SCREEN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None, None
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode):
             return None, None
-        return f.read(16 * 2**20), st.st_mtime
+        try:
+            return f.read(limit), st.st_mtime
+        except OSError:
+            return None, None
+
+
+def read_status(path=STATUS):
+    try:
+        text = kiosk_file(path, 2**20)[0].decode(errors="replace").strip()
+        s = json.loads(text[text.index("(") + 1:text.rindex(")")])
+    except (AttributeError, ValueError):
+        return {}
+    return s if isinstance(s, dict) else {}
+
+
+def screen():
+    """(JPEG bytes, mtime) of the last screenshot, or (None, None)."""
+    return kiosk_file(SCREEN, 16 * 2**20)
 
 
 def uptime():
@@ -480,8 +493,25 @@ class Units:
         return True
 
 
+def text(v, default=""):
+    """A string from a unit's JSON, which can hold any type: else default."""
+    return v if isinstance(v, str) else default
+
+
+def number(v, top=2**32):
+    """A whole number from 0 to top from a unit's JSON, else 0."""
+    return v if type(v) is int and 0 <= v <= top else 0
+
+
+# A unit's status as the pages use it: these keys, these types, whatever the unit sent
+STATUS_TEXT = {"name": "", "ip": "", "version": "", "state": "", "screen": "Unknown", "code": "", "host": "",
+               "tv": "unknown", "method": "", "tunnel": "", "content": "", "sync": "", "override": "unknown",
+               "overlay": "unknown"}
+
+
 class Remote:
-    """One unit through its console's API, with the same calls as LOCAL, so the same pages serve both."""
+    """One unit through its console's API, with the same calls as LOCAL, so the same pages serve both. Answers are
+    checked and typed here, before any page sees them."""
 
     def __init__(self, name, unit):
         self.name, self.u = name, unit
@@ -526,49 +556,66 @@ class Remote:
 
     def status(self, brief=False, timeout=30):
         code, s = self.json("GET", "/api/status" + ("?brief=1" if brief else ""), timeout=timeout)
-        if code != 200 or not isinstance(s.get("health", []), list):
-            raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
+        if code != 200:
+            raise UnitError(text(s.get("error")) or f"{self.name} answered HTTP {code}")
+        hs, health = s.get("hotspot"), s.get("health")
+        s = {**{k: text(s.get(k), d) for k, d in STATUS_TEXT.items()}, "uptime": number(s.get("uptime")),
+             "screenshot": number(s.get("screenshot")) or None,
+             "health": [text(line) for line in health] if isinstance(health, list) else [],
+             "hotspot": {k: text(hs.get(k)) for k in ("ssid", "password", "url")} if isinstance(hs, dict) else None}
+        s["name"] = s["name"] or self.name
         SEEN[self.name] = {"time": time.time(), "status": s}
-        return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
-                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "override": "unknown",
-                "overlay": "unknown", "uptime": 0, "hotspot": None,
-                "health": [], "screenshot": None,
-                **s}
+        return s
 
     def schema(self):
         code, s = self.json("GET", "/api/settings")
         if code != 200 or not isinstance(s.get("keys"), list):
-            raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
-        return s
+            raise UnitError(text(s.get("error")) or f"{self.name} answered HTTP {code}")
+        keys = []
+        for k in s["keys"]:
+            if not isinstance(k, dict) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key := text(k.get("key"))):
+                continue
+            choices = k.get("choices")
+            keys.append({"key": key, "type": text(k.get("type"), "text"), "label": text(k.get("label"), key),
+                         "hint": text(k.get("hint")), "value": text(k.get("value")), "default": text(k.get("default")),
+                         "set": k.get("set") is True, "choices": [text(c) for c in choices]
+                         if isinstance(choices, list) else []})
+        return {"version": text(s.get("version")), "keys": keys, **({"error": s["error"]} if text(s.get("error"))
+                                                                     else {})}
 
     def save(self, changes):
         if not changes:
             return True, "Nothing changed", None
         code, r = self.json("POST", "/api/settings", changes, timeout=330)
-        return (True, r.get("message", "Saved"), None) if code == 200 else (False, r.get("error", ""), r.get("key"))
+        return (True, text(r.get("message"), "Saved"), None) if code == 200 else (
+            False, text(r.get("error")), text(r.get("key")) or None)
+
+    def done(self, code, r):
+        """(ok, message) of a change through the API."""
+        return code == 200 and r.get("ok") is True, text(r.get("message")) or text(r.get("error"))
 
     def action(self, name):
-        code, r = self.json("POST", "/api/action", {"action": name}, timeout=90)
-        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+        return self.done(*self.json("POST", "/api/action", {"action": name}, timeout=90))
 
     def override(self, power, length="", at=""):
-        code, r = self.json("POST", "/api/override", {"override": power, "for": length, "until": at}, timeout=90)
-        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+        return self.done(*self.json("POST", "/api/override", {"override": power, "for": length, "until": at},
+                                    timeout=90))
 
     def overlay(self, state):
-        code, r = self.json("POST", "/api/overlay", {"overlay": state}, timeout=330)
-        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+        return self.done(*self.json("POST", "/api/overlay", {"overlay": state}, timeout=330))
 
     def update(self, url, sha256):
-        code, r = self.json("POST", "/api/update", {"url": url, "sha256": sha256}, timeout=360)
-        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+        return self.done(*self.json("POST", "/api/update", {"url": url, "sha256": sha256}, timeout=360))
 
     def logs(self, which=LOGS):
         code, r = self.json("GET", "/api/logs")
-        return {w: str(r.get(w, "")) for w in which}
+        return {w: text(r.get(w)) for w in which}
 
     def networks(self):
-        return self.json("GET", "/api/wifi")[1].get("networks", [])
+        nets = self.json("GET", "/api/wifi")[1].get("networks")
+        return [{"ssid": text(n.get("ssid")), "signal": number(n.get("signal"), 100),
+                 "security": text(n.get("security"))} for n in (nets if isinstance(nets, list) else [])
+                if isinstance(n, dict)]
 
     def screen(self):
         """(JPEG, time) of the unit's last screenshot, fetched once per screenshot; the last one we have when it is
@@ -636,6 +683,9 @@ def claimed():
 
 
 CLAIM_LOCK = threading.Lock()
+# Logins and claims one at a time, from the limit check to the count: parallel guesses can't pass the limit together,
+# nor run PBKDF2 at once. ponytail: one global lock, so a login waits behind any guess in progress (under a second).
+LOGIN_LOCK = threading.Lock()
 
 
 def claim_code():
@@ -912,7 +962,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 65536:
+        if not 0 <= n <= 65536:  # -1 would read to the end, however long
             raise ValueError("Request too large")
         return self.rfile.read(n).decode(errors="replace") if n else ""
 
@@ -991,14 +1041,14 @@ class Handler(BaseHTTPRequestHandler):
             form = self.form()
             if not self.csrf_ok(form.get("csrf")):
                 msg = "The form expired. Try again."
-            elif self.limiter.blocked(ip):
-                msg = "Too many tries. Wait a few minutes."
             else:
-                msg = claim(form.get("code", ""), form.get("password", ""), form.get("repeat", ""))
+                with LOGIN_LOCK:
+                    msg = "Too many tries. Wait a few minutes." if self.limiter.blocked(ip) else claim(
+                        form.get("code", ""), form.get("password", ""), form.get("repeat", ""))
+                    if msg == "Wrong claim code":
+                        self.limiter.fail(ip)
                 if msg is None:
                     return self.redirect("/", self.start_session(True))
-                if msg == "Wrong claim code":
-                    self.limiter.fail(ip)
         where = (f"the code from <code>sudo cat {e(RUN)}/claim</code> on the fleet server" if FLEET else
                  "the code shown on its TV (or from <code>sudo tvlink console claim</code>)")
         body = (f'<div class="narrow"><p>This {"fleet console" if FLEET else "unit"} has no password yet. Enter '
@@ -1023,13 +1073,15 @@ class Handler(BaseHTTPRequestHandler):
             form = self.form()
             if not self.csrf_ok(form.get("csrf")):
                 msg = "The form expired. Try again."
-            elif self.limiter.blocked(ip):
-                msg = "Too many tries. Wait a few minutes."
-            elif check_password(form.get("password", ""), read_file(os.path.join(STATE, "password")) or ""):
-                return self.redirect("/", self.start_session(True))
             else:
-                self.limiter.fail(ip)
-                msg = "Wrong password"
+                with LOGIN_LOCK:
+                    if self.limiter.blocked(ip):
+                        msg = "Too many tries. Wait a few minutes."
+                    elif not check_password(form.get("password", ""), read_file(os.path.join(STATE, "password")) or ""):
+                        self.limiter.fail(ip)
+                        msg = "Wrong password"
+                if not msg:
+                    return self.redirect("/", self.start_session(True))
         reset = (f"On the fleet server: <code>sudo rm {e(STATE)}/password</code>, restart tvlink-fleet and claim it"
                  " again"
                  if FLEET else "On the unit: <code>sudo tvlink console reset</code>")
@@ -1097,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         if wifi:
             nets = self.unit.networks()
             extra = '<datalist id="ssids">' + "".join(f'<option value="{e(n["ssid"])}">' for n in nets) + "</datalist>"
-            rows = "".join(f'<tr><td>{e(n["ssid"])}</td><td>{n["signal"]}%</td><td>{e(n["security"])}</td></tr>'
+            rows = "".join(f'<tr><td>{e(n["ssid"])}</td><td>{e(str(n["signal"]))}%</td><td>{e(n["security"])}</td></tr>'
                            for n in nets) or '<tr><td colspan="3">None seen</td></tr>'
             body = (f'<h2>Visible Networks</h2><section><table><thead><tr><th>Network</th><th>Signal</th>'
                     f'<th>Security</th></tr></thead><tbody>{rows}</tbody></table></section>')
@@ -1438,6 +1490,15 @@ def test():
         assert hotspot(os.path.join(tmp, "state")) == {"ssid": "tvlink-tv-lobby-01", "password": "abcd-efgh-jkmn",
                                                        "url": "http://10.42.0.1"}
         assert hotspot(os.path.join(tmp, "none")) is None
+    with tempfile.TemporaryDirectory() as tmp:  # status.js is the kiosk's: never through a link, a FIFO or past 1 MiB
+        path = lambda name: os.path.join(tmp, name)
+        write_file(path("status.js"), 'tvlink({"state":"ready"})\n')
+        write_file(path("big"), 'tvlink({"state":"ready","x":"' + "x" * 2**20 + '"})')
+        write_file(path("list"), "tvlink([1])")
+        os.symlink(path("status.js"), path("link"))
+        os.mkfifo(path("fifo"))
+        assert read_status(path("status.js")) == {"state": "ready"}
+        assert all(read_status(path(n)) == {} for n in ("link", "fifo", "big", "list", "none"))
     # Rate limit: per client, then for everyone, and the window slides
     lim = Limiter(3, 60)
     for _ in range(3):
@@ -1471,6 +1532,7 @@ def test():
     assert set(METHODS) == {"cec", "ir", "signal", "none"}  # as tvlink's POWER_METHOD choices
     assert save({"bad key": "1"})[0] is False and save({"A": 1})[0] is False and save({}) == (True, "Nothing changed",
                                                                                                 None)
+    assert save({"A": "1\nTUNNEL_TOKEN=x"}) == (False, "Value for A can't contain a newline", "A")  # one key a line
     with tempfile.TemporaryDirectory() as tmp:
         STATE, RUN = tmp, tmp
         # Tokens: shown once, stored hashed, checked, revoked
@@ -1496,6 +1558,7 @@ def test():
         assert claim(code, "long enough pw", "long enough pw") is None and claimed()
         assert check_password("long enough pw", read_file(os.path.join(tmp, "password")))
         assert claim_code() == "" and claim(code, "long enough pw", "long enough pw") == "Already claimed"
+        test_server(tmp)
     assert duration(59) == "0 min" and duration(3700) == "1 h 1 min" and duration(90000) == "1 d 1 h"
     # Overrides: only these arguments reach sudo; a time wins over a length; clear takes none
     assert override_args("on") == ["on"] and override_args("off", "4h") == ["off", "4h"]
@@ -1522,6 +1585,49 @@ def test():
     assert Handler.client_ip(req("::1", Cf_Connecting_IP="x")) == "::1" and Handler.client_ip(req("::1")) == "::1"
     test_fleet()
     print("ok")
+
+
+def test_server(tmp):
+    """The login page over HTTP: parallel wrong guesses with one form pass the limit no faster than one by one, and a
+    negative Content-Length is refused at once."""
+    import http.client
+    global check_password
+    write_file(os.path.join(tmp, "password"), hash_password("long enough pw", 1000) + "\n")
+    checked, real = [], check_password
+
+    def slow(*args):  # as slow as PBKDF2 on a Pi, more or less, so guesses overlap
+        checked.append(1)
+        time.sleep(0.05)
+        return real(*args)
+
+    Quiet = type("Quiet", (Handler,), {"log_message": lambda *args: None, "limiter": Limiter()})
+    srv = type("Busy", (ThreadingHTTPServer,), {"request_queue_size": 64})(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    check_password, port = slow, srv.server_port
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/login")
+        r = c.getresponse()
+        cookie = r.getheader("Set-Cookie").split(";")[0]
+        csrf = re.search(r'name="csrf" value="([^"]+)"', r.read().decode())[1]
+
+        def guess(i):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            c.request("POST", "/login", f"csrf={csrf}&password=guess{i}",
+                      {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"})
+            c.getresponse().read()
+
+        ts = [threading.Thread(target=guess, args=(i,)) for i in range(20)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert len(checked) == TRIES, len(checked)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n" + b"a" * 1000)
+            assert sock.recv(64).startswith(b"HTTP/1.0 400 "), "a negative Content-Length was read"
+    finally:
+        check_password = real
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_fleet():
@@ -1561,6 +1667,11 @@ def test_fleet():
 
     # Remote, against stand-in units: the tokens it sends, redirects never followed, every failure says what to check
     seen = []
+    evil = {"api/status": {"state": ["x"], "tv": 5, "method": {}, "uptime": "9", "screenshot": "1; x", "name": None,
+                           "health": "<b>", "hotspot": {"ssid": 7}},
+            "api/settings": {"version": 1, "error": {}, "keys": [5, {"key": "<b>"}, {"key": "FIT", "type": 3,
+                                                                                      "choices": "ab", "value": [1]}]},
+            "api/wifi": {"networks": [{"ssid": 1, "signal": "<h1>", "security": None}, "x"]}}
 
     class Unit(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -1589,6 +1700,8 @@ def test_fleet():
                 return self.answer(401, {"error": "Log in"})
             if path == "api/screenshot":
                 return self.answer(200, b"\xff\xd8JPEG", "image/jpeg")
+            if kind == "evil":  # a unit that sends any JSON type anywhere
+                return self.answer(200, evil.get(path.split("?")[0], evil["api/status"]))
             self.answer(200, {"name": kind, "state": "ready", "tv": "on", "version": "0.1.0", "screenshot": 1700000000,
                               "health": []})
 
@@ -1597,6 +1710,8 @@ def test_fleet():
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if "OVERLAY_CORNER" in body:
                 return self.answer(400, {"error": "OVERLAY_CORNER is ...", "key": "OVERLAY_CORNER"})
+            if self.path.startswith("/evil/"):
+                return self.answer(200 if body.get("action") else 400, {"ok": "yes", "message": [1], "key": 2})
             self.answer(200, {"ok": True, "message": f"did {body.get('action')}"})
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Unit)
@@ -1625,6 +1740,17 @@ def test_fleet():
         except UnitError as err:
             assert says in str(err), err
     assert len(seen) == n + 3  # the redirect was not followed
+    # A unit that sends the wrong types: typed before any page sees them, so pages neither break nor carry markup
+    ev = Remote("evil", at("evil"))
+    s = ev.status()
+    assert s["state"] == "" and s["tv"] == "unknown" and s["uptime"] == 0 and s["screenshot"] is None
+    assert s["name"] == "evil" and s["health"] == [] and s["hotspot"] == {"ssid": "", "password": "", "url": ""}
+    assert badge(s) == ("warn", "Unknown") and SEEN["evil"]["status"] == s
+    sch = ev.schema()
+    assert sch["version"] == "" and "error" not in sch and [k["key"] for k in sch["keys"]] == ["FIT"]
+    assert sch["keys"][0]["type"] == "text" and sch["keys"][0]["value"] == "" and 'name="FIT"' in field(sch["keys"][0])
+    assert ev.networks() == [{"ssid": "", "signal": 0, "security": ""}]
+    assert ev.action("reload") == (False, "") and ev.save({"FIT": "x"}) == (False, "", None)
     # poll: all at once; a slow or dead unit shows as such without holding up the page, and lands later
     dead = {"url": "http://127.0.0.1:9/x", "token": "tvl_t"}  # the discard port: refused
     t0 = time.monotonic()

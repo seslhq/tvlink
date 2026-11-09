@@ -20,13 +20,16 @@ modes, presence and clock logic (including clock changes), every power mode with
 re-wake loop with IR), overrides (over each mode through a day, their end by length, time or the next on-hours boundary
 across clock changes, the root-only file, the console's arguments), the read-only root's state from the next boot, the
 badge and the dark-screen check, and the console's password hashing, sessions, CSRF tokens, login rate limit (and the
-visitor's address through a tunnel), settings forms, power methods and API tokens; the daily browser restart's timing
-(once on the day clocks go back, an hour late when they go forward, never in the first hour after boot or while dark);
-synced content's manifest checks, https-only redirects, and syncs against a stand-in server (only changed files fetched,
-the rest linked; a bad checksum, an oversized or missing file refused with the live set kept; older sets pruned) and
-`manifest`; the setup hotspot's start, stop and retry timing, its name and passwords, what counts as online, and the
-badge's setup line; and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects
-refused, each failure's message), the overview not waiting on a slow or dead unit, and its badges.
+visitor's address through a tunnel; over HTTP, parallel guesses get no further, and a negative Content-Length is refused
+at once), status.js read safely (no link, FIFO or more than 1 MiB), settings forms, power methods and API tokens; the
+daily browser restart's timing (once on the day clocks go back, an hour late when they go forward, never in the first
+hour after boot or while dark); synced content's manifest checks, https-only redirects, and syncs against a stand-in
+server (only changed files fetched, the rest linked; a bad checksum, an oversized or missing file refused with the live
+set kept; older sets pruned; a server that trickles bytes refused at the deadline) and `manifest`; the setup hotspot's
+start, stop and retry timing, its name and passwords, what counts as online, and the badge's setup line; and the fleet
+console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each failure's message), the
+overview not waiting on a slow or dead unit, its badges, and a unit that sends wrong types (typed before any page sees
+them).
 
 ## The VM
 
@@ -80,15 +83,20 @@ tests/vm.sh
   (stored root-only) and sending them, and tvlink-power sending the on code at start;
 - Wi-Fi join, Wi-Fi country, a rerun that leaves the link up, power save, fallback to the hidden WPA network, and the
   Ethernet-out network check;
-- the splash handing over to the board, the live badge, and a screenshot;
+- the splash handing over to the board, the live badge, and a screenshot; the badge and identify out of the page's
+  reach (the test board's own script reports what it can see: not tvlink's global, nor their shadow roots); a
+  `BOARD_URL` with a control character refused, and ignored in a hand-edited conf;
 - the kiosk user's limits: the render group only, no polkit rights, and a home it can't write;
 - nothing written to the kiosk's home, and `/run/tvlink` staying small;
 - the console: the claim code from `tvlink console claim` and on the splash, a wrong code refused, claiming sets a
   PBKDF2 password, login (a wrong password refused), a form without its CSRF token and an API call without its CSRF
-  header refused, the API refused with no session or token, the console user unable to run other commands as root,
-  an API token (stored hashed only) reloading the page and fetching the screenshot, then revoked and refused, a
-  settings round trip through the API (`OVERLAY_CORNER`, not logged by sudo, a bad value refused with its key), and
-  the claim code gone from the splash once claimed. The checks use curl against `http://127.0.0.1` inside the VM;
+  header refused, the API refused with no session or token, the console user unable to run other commands as root (nor
+  `tvlink set` with settings as arguments), its `tvlink` getting `$` in arguments as given and settings on stdin saved
+  as given, a Wi-Fi password set through the API on no command line meanwhile (sampled from `/proc`) and in
+  NetworkManager as given, an API token (stored hashed only) reloading the page and fetching the screenshot, then
+  revoked and refused, a settings round trip through the API (`OVERLAY_CORNER`, not logged by sudo, a bad value refused
+  with its key), and the claim code gone from the splash once claimed. The checks use curl against `http://127.0.0.1`
+  inside the VM;
 - the console behind a tunnel: Access and proxy headers alone don't authenticate, and the cookie is `Secure` with
   `Cf-Visitor` or `X-Forwarded-Proto` saying HTTPS, and not otherwise;
 - the tunnel: a malformed token refused; a made-up one set through the console API installs cloudflared from
@@ -129,11 +137,12 @@ tests/vm.sh
   line, not `cmdline.txt`, so the overlay boot itself is simulated: a chroot whose root is a real overlay over the
   VM's, as overlayroot mounts it. There `tvlink overlay status` says it is on, and `tvlink update`, install.sh and
   `TUNNEL_TOKEN` refuse, and apt's units would be skipped;
-- the setup hotspot: with `HOTSPOT_MIN=1`, the unit's Wi-Fi set to a network that isn't there and Ethernet's route
-  gone, the hotspot starts within a minute or so, named after the host, WPA2; status.js, the splash (across the top)
-  and the console's Wi-Fi page show its name and password; a phone (`wlan2` in the `ap` namespace) joins with the
-  password from status.js, gets an address from it and opens the console's login page; the working network set
-  through the console's API over the hotspot stops it, and the unit joins that network; the password is in no log.
+- the setup hotspot: with `HOTSPOT_MIN=1`, the unit's Wi-Fi set to a network that isn't there and Ethernet's route gone,
+  the hotspot starts within a minute or so, named after the host, WPA2, its password given to nmcli in a file and on no
+  command line; status.js, the splash (across the top) and the console's Wi-Fi page show its name and password; a phone
+  (`wlan2` in the `ap` namespace) joins with the password from status.js, gets an address from it and opens the
+  console's login page; the working network set through the console's API over the hotspot stops it, and the unit joins
+  that network; the password is in no log.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.

@@ -48,7 +48,10 @@ badge state in over the DevTools pipe instead.
   without a mouse. It ignores `video=`, so the kiosk sets `RESOLUTION` with `wlr-randr` and repeats it every 30 s for
   TVs that come back from standby at their own mode.
 - **DevTools over a pipe, not a port.** `--remote-debugging-pipe` gives the agent Chromium's protocol with no TCP
-  port, no websocket library and no origin rules. The agent is Python standard library only and needs no root.
+  port, no websocket library and no origin rules. The agent is Python standard library only and needs no root. The
+  badge and identify run in a JavaScript world of their own: the page shares the DOM but not their globals or
+  prototypes, so its scripts (or a third party's on it) can't read the hotspot password or the claim code, nor change
+  the badge.
 - **Recovery.** A crashed tab, two missed health checks in a row, a Chromium error page, or a 5xx page while the probe
   says the server is up: go back to the splash, which hands over again when the page answers. At most once a minute;
   after three tries in 10 minutes the browser restarts. An empty 404 or 410 is the server's own answer, so it stays
@@ -110,7 +113,8 @@ badge state in over the DevTools pipe instead.
   downloads and its SHA-256 after, into a new set beside the live one; a symlink renamed over `current` swaps the set
   in one step, and any failure keeps the old one. Unchanged files are hard links to the live set, and an unchanged
   manifest writes nothing. The set before stays until the next sync, so the splash never loses a file mid-show. A
-  service with its own loop, not a timer: the interval is a setting, and a restart is "sync now".
+  sync gets an hour, checked as each read returns, so a server that trickles bytes can't hold it. A service with its
+  own loop, not a timer: the interval is a setting, and a restart is "sync now".
 - **Last good screen: the kiosk takes it, root keeps it.** The agent saves the live page (badge hidden) to its own
   `/run/tvlink` every 10 min; an hourly timer has root copy it to `/var/lib/tvlink/last.jpg`, which the kiosk can
   read but not write. Root reads the kiosk's file as the kiosk (`runuser`, with a timeout), so a link or FIFO planted
@@ -175,13 +179,15 @@ badge state in over the DevTools pipe instead.
   listens. Plain HTTP on the LAN; HTTPS is the tunnel's job.
 - **Privilege model.** The console runs as `tvlink-console` in a systemd sandbox (read-only system, private `/tmp`, no
   home directories, other users' processes hidden). Root is reachable only through `/etc/sudoers.d/tvlink-console`: an
-  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set`, `update`, `override` and
-  `overlay`, which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the
-  settings that imply it. A process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run`
-  when sudo starts it for the console: its commands then run as from a root shell. sudo does not log these commands,
-  since `tvlink set` can carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep
-  the console from parsing human output; the settings form is built from `tvlink keys --json`, so a new key shows up by
-  itself.
+  exact list of `/usr/local/bin/tvlink` subcommands, with `set --stdin` only, and wildcards only after `update`,
+  `override` and `overlay`, which check every argument themselves. sudo is setuid, so the unit can't use
+  `NoNewPrivileges` or the settings that imply it. A process started by sudo inherits the sandbox, so `tvlink` reruns
+  itself with `systemd-run` (`--expand-environment=no`: a `$` stays as given) when sudo starts it for the console: its
+  commands then run as from a root shell. sudo does not log these commands. Secrets stay off command lines, which any
+  local user can read: settings reach `tvlink set --stdin` on stdin, `tvlink net` gives NetworkManager each Wi-Fi
+  profile as a keyfile in its root-only `/run` folder, and the hotspot's password goes to nmcli in a root-only file.
+  Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from parsing human output; the
+  settings form is built from `tvlink keys --json`, so a new key shows up by itself.
 - **Tunnel: Cloudflare, one per unit, opt-in.** `TUNNEL_TOKEN` is the only setting: a unit without it has no
   cloudflared and no extra apt repo, so behaviour is unchanged. Setting it installs cloudflared from Cloudflare's own
   apt repo on demand (not in install.sh: most units never need it, and the token is set after install anyway), and
@@ -195,14 +201,16 @@ badge state in over the DevTools pipe instead.
   always needed. Headers only decide the cookie's `Secure` flag (`Cf-Visitor`, `X-Forwarded-Proto`) and, from
   loopback only, which visitor the login limit counts (`Cf-Connecting-IP`).
 - **Fleet mode in the same file.** `tvlink-console --fleet` serves the same pages for any unit: the page code takes its
-  data from a backend with the same calls, `LOCAL` (this unit, through `tvlink`) or `Remote` (a unit's JSON API with
-  its API token and an Access service token), so there is one set of forms and one place to fix them. The fleet keeps
-  its own password, claim code and units list (fleet user only), never follows redirects (they would carry the
-  tokens), and asks all units at once with a 4 s cap, keeping what each said last in memory. It needs nothing but
-  Python 3, so it runs on any server; it listens on loopback for its own tunnel.
+  data from a backend with the same calls, `LOCAL` (this unit, through `tvlink`) or `Remote` (a unit's JSON API with its
+  API token and an Access service token), so there is one set of forms and one place to fix them. The fleet keeps its
+  own password, claim code and units list (fleet user only), never follows redirects (they would carry the tokens),
+  types every answer before a page uses it (a unit can send anything), and asks all units at once with a 4 s cap,
+  keeping what each said last in memory. It needs nothing but Python 3, so it runs on any server; it listens on loopback
+  for its own tunnel.
 - **Logins kept simple.** One password per unit (PBKDF2-SHA256), sessions in memory, a CSRF token on every change, a
-  login rate limit, and per-unit API tokens stored hashed for fleet tools. No accounts, no roles: anyone who can log
-  in can do everything, including updates.
+  login rate limit (one check at a time, so parallel guesses get no further, nor run PBKDF2 at once), and per-unit API
+  tokens stored hashed for fleet tools. No accounts, no roles: anyone who can log in can do everything, including
+  updates.
 
 ## Platform facts
 

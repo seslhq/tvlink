@@ -14,7 +14,7 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 
 | Command | Does |
 | --- | --- |
-| `tvlink show`, `sudo tvlink set KEY=value` | Read and change settings ([configuration](configuration.md)) |
+| `tvlink show`, `sudo tvlink set KEY=value` | Read and change settings ([configuration](configuration.md)); `set --stdin` takes `KEY=value` lines on stdin, off the command line |
 | `sudo tvlink on`, `sudo tvlink off`, `tvlink status` | TV power by `POWER_METHOD`, and what is known of the TV: CEC's answer, the signal last sent, or `unknown` (IR) |
 | `sudo tvlink override on\|off [4h\|until 07:00]`, `sudo tvlink override clear` | Force the TV on or off for a while, over the power mode; `sudo tvlink override` shows it ([overrides](configuration.md#overrides)) |
 | `sudo tvlink ir learn on\|off`, `sudo tvlink ir test on\|off` | Record a power code from the TV's remote; send one once ([IR](setup.md#ir-transmitter-and-receiver)) |

@@ -1,7 +1,7 @@
 # tvlink-console (the unit console) may run these tvlink commands as root, and nothing else. Installed by install.sh
-# as /etc/sudoers.d/tvlink-console after visudo checks it. Not logged: tvlink set's values can be secrets; and no PAM
-# session, which would log two lines per command. A * takes any arguments: set, update, override and overlay check
-# their own.
+# as /etc/sudoers.d/tvlink-console after visudo checks it. Settings go on stdin (set --stdin), never as arguments: they
+# can be secrets. Not logged anyway, and no PAM session, which would log two lines per command. A * takes any
+# arguments: update, override and overlay check their own.
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
 Defaults:tvlink-console !log_allowed, !pam_session
@@ -9,6 +9,6 @@ Cmnd_Alias TVLINK_CONSOLE = /usr/local/bin/tvlink status, /usr/local/bin/tvlink 
   /usr/local/bin/tvlink on, /usr/local/bin/tvlink off, /usr/local/bin/tvlink identify, \
   /usr/local/bin/tvlink reload, /usr/local/bin/tvlink screenshot, /usr/local/bin/tvlink reboot, \
   /usr/local/bin/tvlink logs kiosk, /usr/local/bin/tvlink logs power, /usr/local/bin/tvlink logs net, \
-  /usr/local/bin/tvlink set *, /usr/local/bin/tvlink update *, /usr/local/bin/tvlink override, \
+  /usr/local/bin/tvlink set --stdin, /usr/local/bin/tvlink update *, /usr/local/bin/tvlink override, \
   /usr/local/bin/tvlink override *, /usr/local/bin/tvlink overlay *
 tvlink-console ALL=(root) NOPASSWD: TVLINK_CONSOLE

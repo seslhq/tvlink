@@ -103,16 +103,23 @@ def parse(data, base):
     return out
 
 
+def chunks(r, deadline):
+    """A response's body as it comes, refused past the deadline: read1 returns what each read brings, so a server that
+    trickles a byte at a time can't hold a read open for long (read waits for 64 KiB)."""
+    while chunk := r.read1(1 << 16):
+        if time.monotonic() > deadline:
+            raise ValueError("too slow: the sync ran past an hour")
+        yield chunk
+
+
 def download(url, path, size, sha256, deadline):
     """The file at url into path: no more than size bytes, and only with that sha256."""
     h, n = hashlib.sha256(), 0
     with fetch(url) as r, open(path, "xb") as f:
-        while chunk := r.read(1 << 16):
+        for chunk in chunks(r, deadline):
             n += len(chunk)
             if n > size:
                 raise ValueError("bigger than its listed size")
-            if time.monotonic() > deadline:
-                raise ValueError("too slow: the sync ran past an hour")
             h.update(chunk)
             f.write(chunk)
     if n != size:
@@ -153,15 +160,19 @@ def sync(url, root=SYNC):
     os.makedirs(root, 0o755, exist_ok=True)
     current, had = live(root)
     prune(root, current)
+    deadline, data = time.monotonic() + 3600, b""
     with fetch(url) as r:
-        data = r.read(MAX_MANIFEST + 1)
+        for chunk in chunks(r, deadline):
+            data += chunk
+            if len(data) > MAX_MANIFEST:
+                break
     if len(data) > MAX_MANIFEST:
         raise ValueError(f"the manifest is over {MAX_MANIFEST >> 20} MB")
     files = parse(data, url)
     want = {name: sha for name, _, sha, _ in files}
     if current and had == want:
         return f"{summary(files)}, unchanged"
-    new, deadline = tempfile.mkdtemp(prefix="set-", dir=root), time.monotonic() + 3600
+    new = tempfile.mkdtemp(prefix="set-", dir=root)
     try:
         for name, furl, sha, size in files:
             dst = os.path.join(new, name)
@@ -384,7 +395,49 @@ def test():
         made = parse(manifest(src), base)
         assert [(n, u.rsplit("/", 1)[1], s) for n, u, s, _ in made] == [("01 a.png", "01%20a.png", sha(a)),
                                                                       ("b.mp4", "b.mp4", sha(b))], made
+        # A server that trickles a byte at a time: refused at the deadline, not held for good
+        test_trickle(os.path.join(root, "slow.png"))
     print("ok")
+
+
+def test_trickle(path):
+    import http.server
+    import threading
+    global fetch
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                for _ in range(100000):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.02)
+            except OSError:
+                pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    fetch, got = (lambda url: urllib.request.urlopen(url, timeout=30)), []
+
+    def attempt():
+        try:
+            download(f"http://127.0.0.1:{srv.server_port}/slow.png", path, 100000, "0" * 64, time.monotonic() + 1)
+        except ValueError as e:
+            got.append(str(e))
+
+    t = threading.Thread(target=attempt, daemon=True)
+    t.start()
+    t.join(10)
+    srv.shutdown()
+    srv.server_close()
+    assert got == ["too slow: the sync ran past an hour"], got
 
 
 if __name__ == "__main__":

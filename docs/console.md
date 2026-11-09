@@ -43,14 +43,16 @@ keeps the current one, and Clear removes it.
 - **Privileges.** The console runs as its own system user, `tvlink-console`, in a systemd sandbox (read-only system,
   private `/tmp`, no home directories), with only the capability to bind port 80. It reaches root through sudo, for a
   fixed list of `tvlink` commands in `/etc/sudoers.d/tvlink-console` (`status`, `doctor`, `on`, `off`, `identify`,
-  `reload`, `screenshot`, `reboot`, `logs`, `set`, `update`, `override`, `overlay`). Arguments go to sudo as a list,
-  never through a shell, and sudo does not log them (`set` can carry a Wi-Fi password).
+  `reload`, `screenshot`, `reboot`, `logs`, `set --stdin`, `update`, `override`, `overlay`). Settings go on stdin,
+  never as arguments, since they can be secrets; arguments go to sudo as a list, never through a shell, and sudo does
+  not log them.
 - **Login.** One password per unit, stored as a PBKDF2-SHA256 hash (600,000 rounds) readable only by the console user.
   Sessions are in memory (a restart logs everyone out) and expire after 12 hours. The cookie is `HttpOnly` and
   `SameSite=Strict`, and `Secure` when the request came through an HTTPS tunnel or proxy (`Cf-Visitor` says
   `https`, or `X-Forwarded-Proto: https`).
 - **Forms.** Every change needs the session's CSRF token. Five wrong passwords or claim codes from one address in five
-  minutes (or 20 from all) lock logins out until the window passes. Through cloudflared on the unit, the address is
+  minutes (or 20 from all) lock logins out until the window passes; tries are checked one at a time, so parallel ones
+  get no further. Through cloudflared on the unit, the address is
   the visitor's (`Cf-Connecting-IP`), taken only from loopback, so no one on the network can choose their own.
 - **Tokens.** Random 256-bit, shown once when made, stored as SHA-256 only. A token can do everything the console can,
   including updates, so give each fleet or script its own and revoke it when done.

@@ -18,6 +18,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
@@ -91,15 +92,21 @@ def save(name, psk, path=None):
 
 
 def start(name, psk):
-    """The access point: WPA2 (CCMP), 2.4 GHz channel 6, legal in every country and seen by every phone."""
+    """The access point: WPA2 (CCMP), 2.4 GHz channel 6, legal in every country and seen by every phone. The password
+    goes to nmcli in a file (root only, removed after), never on its command line."""
     stop()
     run("nmcli", "radio", "wifi", "on")
     ok = run("nmcli", "connection", "add", "save", "no", "type", "wifi", "con-name", NAME, "ifname", DEV,
              "autoconnect", "no", "ssid", name, "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
              "802-11-wireless.channel", "6", "ipv4.method", "shared", "ipv4.addresses", f"{ADDR}/24",
              "ipv6.method", "disabled", "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
-             "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp", "wifi-sec.psk", psk)[0]
-    if ok and run("nmcli", "-w", "30", "connection", "up", NAME)[0]:
+             "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp")[0]
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(STATE)) as tmp:  # 0700
+        secret = os.path.join(tmp, "psk")
+        with open(os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(f"802-11-wireless-security.psk:{psk}\n")
+        ok = ok and run("nmcli", "-w", "30", "connection", "up", NAME, "passwd-file", secret)[0]
+    if ok:
         save(name, psk)
         return True
     stop()
