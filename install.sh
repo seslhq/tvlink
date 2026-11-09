@@ -5,7 +5,8 @@
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run as root: sudo ./install.sh" >&2; exit 1; }
 # Under the read-only overlay every change here would vanish at the next reboot.
-! grep -q ' / overlay ' /proc/mounts || { echo "Overlay file system is on: turn it off and reboot first" >&2; exit 1; }
+! grep -q ' / overlay ' /proc/mounts ||
+  { echo "The read-only root is on: turn it off (sudo tvlink overlay off) and reboot first" >&2; exit 1; }
 cd "$(dirname "$0")"
 BOOT=/boot/firmware
 CONF=$BOOT/tvlink.conf
@@ -64,6 +65,14 @@ mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d /etc/systemd/system.conf.
   /etc/chromium/policies/managed
 printf '[Timer]\nOnCalendar=\nOnCalendar=%s*-*-* 02:30\nRandomizedDelaySec=15m\nPersistent=false\n' \
   "${UPDATE_DAY:+$UPDATE_DAY }" >/etc/systemd/system/apt-daily-upgrade.timer.d/tvlink.conf
+# Under the read-only root (tvlink overlay) downloads and upgrades would land in RAM and be gone at the next boot: none.
+for u in apt-daily apt-daily-upgrade; do
+  mkdir -p "/etc/systemd/system/$u.service.d"
+  cat >"/etc/systemd/system/$u.service.d/tvlink.conf" <<'EOF'
+[Service]
+ExecCondition=/bin/sh -c '! grep -q " / overlay " /proc/mounts'
+EOF
+done
 # A hung kernel reboots the Pi (15 s is the most every Pi watchdog driver accepts). Applies from the next boot.
 printf '[Manager]\nRuntimeWatchdogSec=15\nRebootWatchdogSec=10min\n' >/etc/systemd/system.conf.d/tvlink.conf
 # Wi-Fi power save causes most Pi signage drop-outs: off, in raspi-config's own file.

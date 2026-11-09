@@ -304,6 +304,7 @@ def status(brief=False):
     _, tunnel, _ = tvlink("tunnel", root=False, timeout=10)
     _, sync, _ = tvlink("content", "status", root=False, timeout=10)
     _, held, _ = tvlink("override", timeout=30)
+    _, ro, _ = tvlink("overlay", "status", root=False, timeout=30)
     _, doctor, err = (True, "", "") if brief else tvlink("doctor", timeout=60)
     _, shot = screen()
     label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
@@ -313,6 +314,7 @@ def status(brief=False):
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
             "tv": tv or "unknown", "method": power_method(sch), "tunnel": tunnel or "unknown", "uptime": uptime(),
             "content": content_label(s), "sync": sync or "unknown", "override": held or "unknown",
+            "overlay": ro or "unknown",
             "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
 
 
@@ -374,6 +376,20 @@ def override(power, length="", at=""):
     return ok, out or err or "Failed"
 
 
+def overlay(state):
+    """(ok, message): the read-only root on or off from the next boot."""
+    if state not in ("on", "off"):
+        return False, "overlay is on or off"
+    ok, out, err = tvlink("overlay", state, timeout=300)  # the first time: raspi-config installs overlayroot
+    return ok, out or err or "Failed"
+
+
+def overlay_next(text):
+    """on or off: the read-only root from the next boot, from tvlink overlay status (eg "off, on after a reboot")."""
+    words = text.split(",")[-1].split()
+    return words[0] if words and words[0] in ("on", "off") else ""
+
+
 def update(url, sha256):
     ok, out, err = tvlink("update", url, sha256, timeout=330)
     return ok, out or err or "Failed"
@@ -381,7 +397,8 @@ def update(url, sha256):
 
 # What the pages show and do, for this unit; in fleet mode a Remote with the same calls, through the unit's API.
 LOCAL = types.SimpleNamespace(status=status, schema=schema, save=save, action=action, screen=screen, logs=logs,
-                              networks=networks, update=update, override=override)
+                              networks=networks, update=update, override=override,
+                              overlay=overlay)
 
 
 # Fleet mode: units reached through their API
@@ -506,7 +523,8 @@ class Remote:
             raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
         SEEN[self.name] = {"time": time.time(), "status": s}
         return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
-                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "override": "unknown", "uptime": 0,
+                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "override": "unknown",
+                "overlay": "unknown", "uptime": 0,
                 "health": [], "screenshot": None,
                 **s}
 
@@ -528,6 +546,10 @@ class Remote:
 
     def override(self, power, length="", at=""):
         code, r = self.json("POST", "/api/override", {"override": power, "for": length, "until": at}, timeout=90)
+        return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
+
+    def overlay(self, state):
+        code, r = self.json("POST", "/api/overlay", {"overlay": state}, timeout=330)
         return code == 200 and r.get("ok", False), r.get("message") or r.get("error") or ""
 
     def update(self, url, sha256):
@@ -1033,7 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
         tv = f'{s["tv"].capitalize()} ({METHODS.get(s.get("method"), METHODS["cec"])[0]})'  # eg Unknown (Infrared)
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
                 ("TV", e(tv)), ("Override", e(cap(s.get("override", "")))),
-                ("Tunnel", e(s.get("tunnel", "").capitalize())),
+                ("Tunnel", e(s.get("tunnel", "").capitalize())), ("Read-Only Root", e(cap(s.get("overlay", "")))),
                 ("Local Content", e(s.get("content") or "None")), ("Content Sync", e(cap(s.get("sync", "")))),
                 ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
@@ -1085,6 +1107,9 @@ class Handler(BaseHTTPRequestHandler):
         self.settings_page(method, form, wifi=True)
 
     def actions_page(self, method, form):
+        if method == "POST" and "overlay" in form:
+            ok, msg = self.unit.overlay(form["overlay"])
+            return self.flash_back(self.base + "/actions", msg, not ok)
         if method == "POST" and "override" in form:
             ok, msg = self.unit.override(form["override"], form.get("for", ""), form.get("until", ""))
             return self.flash_back(self.base + "/actions", msg, not ok)
@@ -1112,8 +1137,27 @@ class Handler(BaseHTTPRequestHandler):
                  f'<span>Reboot now?</span>'
                  f'<button class="danger" name="action" value="reboot">Reboot Now</button></form></details></div>'
                  f'</div>')
-        body += self.override_form(sch, self.unit.status(brief=True).get("override", "unknown"))
+        s = self.unit.status(brief=True)
+        body += self.override_form(sch, s.get("override", "unknown")) + self.overlay_form(s.get("overlay", "unknown"))
         self.reply(200, self.page("Actions", body, "/actions", flash, bad))
+
+    def overlay_form(self, ro):
+        """The Read-Only Root section: on or off now and from the next boot, and the switch, confirmed on the page."""
+        nxt = overlay_next(ro)
+        if not nxt or "raspi-config" in ro:
+            return ""
+        to = "off" if nxt == "on" else "on"
+        what = ("Turn it off to update tvlink or set the tunnel token: changes then last again." if to == "off" else
+                "The root partition is then kept as it is at each boot, so a power cut can't damage it. Set the "
+                "unit up first: changes outside tvlink.conf (overrides, learned IR codes, a new password or API "
+                "tokens) then last only until the next reboot, content sync pauses, and updates wait until it is off.")
+        csrf = csrf_input(self.sess)
+        return (f'<h2>Read-Only Root</h2><div class="card"><p>Now: {e(cap(ro))}. {what} Either way it takes a reboot.'
+                f'</p><details><summary class="button{" danger" if to == "on" else ""}"><span class="closed">Turn '
+                f'{to.capitalize()}</span><span class="open">Cancel</span></summary><form method="post" '
+                f'action="{self.base}/actions" class="row">{csrf}<span>Turn the read-only root {to} from the next '
+                f'boot?</span><button class="danger" name="overlay" value="{to}">Turn {to.capitalize()}</button></form>'
+                f'</details></div>')
 
     def override_form(self, sch, held):
         """The Override section: what is in force, and on or off for a while (a length, or until a time)."""
@@ -1301,6 +1345,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == ("POST", "/api/override"):
             ok, msg = override(data.get("override"), data.get("for", ""), data.get("until", ""))
             return self.json(200 if ok else 400, {"ok": ok, "message": msg} if ok else {"error": msg})
+        if route == ("POST", "/api/overlay"):
+            ok, msg = overlay(data.get("overlay"))
+            return self.json(200 if ok else 400, {"ok": ok, "message": msg} if ok else {"error": msg})
         if route == ("POST", "/api/update"):
             ok, out, err = tvlink("update", str(data.get("url", "")), str(data.get("sha256", "")), timeout=330)
             return self.json(200 if ok else 400, {"ok": ok, "message": out or err})
@@ -1434,6 +1481,10 @@ def test():
         except ValueError:
             pass
     assert override("sideways") == (False, "override is on, off or clear")
+    # The read-only root's state from the next boot, from tvlink overlay status
+    assert overlay_next("off") == "off" and overlay_next("off, on after a reboot") == "on"
+    assert overlay_next("on, off after a reboot") == "off" and overlay_next("") == "" and overlay_next("unknown") == ""
+    assert overlay("maybe") == (False, "overlay is on or off")
     # Behind a tunnel: the Secure flag from either header; the visitor's IP only from cloudflared on loopback
     req = lambda peer, **h: types.SimpleNamespace(client_address=(peer, 1),
                                                   headers={k.replace("_", "-"): v for k, v in h.items()})

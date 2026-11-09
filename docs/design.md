@@ -121,6 +121,19 @@ badge state in over the DevTools pipe instead.
   boot, and not while the HDMI signal is off (Chromium makes no page then).
 - **Nightly reboot as the backstop.** At 03:30, never in the first hour after boot, never while an upgrade runs, and
   skipped for up to a week while a configured page is down, so an outage keeps the last good screen.
+- **Read-only root: raspi-config's overlay, root partition only, updates refused.** `tvlink overlay` wraps
+  `raspi-config nonint enable_overlayfs` and `disable_overlayfs` (overlayroot), never `do_overlayfs`, which also
+  makes the boot partition read-only and so would freeze tvlink.conf, `tvlink set` and the local content folder. Under
+  it `tvlink update`, install.sh and `TUNNEL_TOKEN` refuse with how to proceed, rather than tvlink running off,
+  reboot, update, on, reboot by itself: that chain needs a marker that survives the overlay (on the FAT partition),
+  two unattended reboots, and a network that holds between them, and a failure anywhere leaves a unit in a state
+  nobody chose, either writable or with a half-done update; while a person turns it off, updates and turns it on, each
+  step shows in the console. Nightly security updates are skipped (`ExecCondition` drop-ins on apt's units): they
+  would fill RAM and the reboot would undo them. tvlink's state on the root partition (overrides, learned IR codes,
+  the console's password and tokens, synced content, the last good screen) stays where it is: the secrets can't move
+  to the FAT partition any PC reads, and the overlay is meant for units that are set up and left alone. What is
+  written while it is on lasts until the next reboot, and the commands that write it say so; content sync pauses, as
+  a new set would sit in RAM.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the
   rest weekly on `UPDATE_DAY`, so a bad package can be held before it reaches everyone.
 - **Cards last.** The kiosk session's `HOME` is the service's runtime dir in RAM, emptied at every start: Chromium's
@@ -141,8 +154,8 @@ badge state in over the DevTools pipe instead.
   listens. Plain HTTP on the LAN; HTTPS is the tunnel's job.
 - **Privilege model.** The console runs as `tvlink-console` in a systemd sandbox (read-only system, private `/tmp`, no
   home directories, other users' processes hidden). Root is reachable only through `/etc/sudoers.d/tvlink-console`: an
-  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set`, `update` and `override`,
-  which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
+  exact list of `/usr/local/bin/tvlink` subcommands, with wildcards only after `set`, `update`, `override` and
+  `overlay`, which check every argument themselves. sudo is setuid, so the unit can't use `NoNewPrivileges` or the settings that imply it. A
   process started by sudo inherits the sandbox, so `tvlink` reruns itself with `systemd-run` when sudo starts it for
   the console: its commands then run as from a root shell. sudo does not log these commands, since `tvlink set` can
   carry a Wi-Fi password. Machine-readable subcommands (`tvlink keys --json`, `tvlink logs`) keep the console from

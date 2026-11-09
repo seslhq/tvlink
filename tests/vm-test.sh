@@ -626,5 +626,54 @@ command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf
 systemctl daemon-reload
 tvlink set BROWSER_RESTART= >/dev/null
 
+echo "== Read-only root (raspi-config; the overlay boot simulated in a chroot)"
+# As on Pi OS: the real raspi-config, from the Raspberry Pi repo (the script alone: its nonint calls need nothing else)
+command -v raspi-config >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q raspi-config-core \
+  >/dev/null 2>&1
+check "raspi-config installed" command -v raspi-config
+tvlink overlay off >/dev/null # left by an earlier run
+check "off" test "$(tvlink overlay status)" = off
+out=$(tvlink overlay on); check "on: from the next boot" says 'on after a reboot'
+check "... status says so" test "$(tvlink overlay status)" = "off, on after a reboot"
+check "... overlayroot installed" quiet dpkg -s overlayroot
+check "... overlayroot=tmpfs in cmdline.txt, once" test "$(arg overlayroot=tmpfs)" = 1
+tvlink set HDMI_FORCE_HOTPLUG=1 >/dev/null
+check "... kept when tvlink rewrites cmdline.txt" test "$(arg overlayroot=tmpfs)$(arg vc4.force_hotplug=1)" = 11
+tvlink set HDMI_FORCE_HOTPLUG=0 >/dev/null
+check "... in tvlink doctor" grep -q 'read-only root off, on after a reboot$' <(tvlink doctor)
+web /api/status >/dev/null
+check "... on the console's Status" test "$(field overlay)" = "off, on after a reboot"
+web /actions >/dev/null
+check "... Actions offers Turn Off, asking first" grep -q 'name="overlay" value="off">Turn Off<' "$c/body"
+check "API overlay off" test "$(web -H "X-CSRF-Token: $t" -d '{"overlay": "off"}' /api/overlay)" = 200
+check "... off" test "$(tvlink overlay status)" = off
+check "... cmdline.txt without it" test "$(arg overlayroot=tmpfs)" = 0
+# The boot itself: a chroot whose root is an overlay over the VM's, as overlayroot=tmpfs mounts it, with the boot
+# partition and this checkout; its mount namespace (and the overlay) goes when the command ends.
+o=/run/tvlink-test-ro
+command rm -rf "$o" && mkdir -p "$o/upper" "$o/work" "$o/root"
+ro() { # command...: run under the read-only root
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  unshare -m bash -c 'o=/run/tvlink-test-ro
+    mount -t overlay overlay -o "lowerdir=/,upperdir=$o/upper,workdir=$o/work" "$o/root" &&
+      mount -t proc proc "$o/root/proc" && mount --rbind /dev "$o/root/dev" &&
+      mount --bind /boot/firmware "$o/root/boot/firmware" && mount --bind "$PWD" "$o/root$PWD" || exit 99
+    exec chroot "$o/root" bash -c "cd \"\$1\" && shift && exec \"\$@\"" _ "$PWD" "$@"' _ "$@"
+}
+check "under it: / is an overlay" quiet ro grep -q ' / overlay ' /proc/mounts
+tvlink overlay on >/dev/null
+out=$(ro tvlink overlay status); check "... status: on" test "$out" = on
+tvlink overlay off >/dev/null
+out=$(ro tvlink overlay status); check "... turned off: on, off after a reboot" test "$out" = "on, off after a reboot"
+out=$(ro tvlink update https://example.com/tvlink.tar.gz "$(printf %064d 0)" 2>&1)
+check "... tvlink update refused" says 'read-only root is on, so an update would be gone'
+out=$(ro ./install.sh 2>&1); check "... install.sh refused" says 'read-only root is on: turn it off'
+out=$(ro tvlink set TUNNEL_TOKEN="$fake" 2>&1); check "... TUNNEL_TOKEN refused" says 'TUNNEL_TOKEN is kept on the root'
+cond=$(sed -n 's/^ExecCondition=//p' /etc/systemd/system/apt-daily-upgrade.service.d/tvlink.conf)
+check "... nightly upgrades skipped" quiet test "$(ro sh -c "$cond"; echo $?)/$(sh -c "$cond"; echo $?)" = 1/0
+out=$(ro tvlink override on 30m); check "... an override says it won't last" says 'lasts until the next reboot'
+check "... and is gone with the overlay" test "$(tvlink override)" = none
+command rm -rf "$o"
+
 echo "== $fails failed"
 [ "$fails" = 0 ]

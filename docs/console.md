@@ -25,9 +25,9 @@ and prints a new code. API tokens keep working.
 
 | Page | Shows or does |
 | --- | --- |
-| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power and the power method, an override in force, the tunnel (off, connected or not connected), where local content plays from (USB stick, synced or SD card) and the last content sync, name, IP, version, uptime, and `tvlink doctor`'s health lines |
+| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power and the power method, an override in force, the tunnel, the read-only root (and what the next boot changes) (off, connected or not connected), where local content plays from (USB stick, synced or SD card) and the last content sync, name, IP, version, uptime, and `tvlink doctor`'s health lines |
 | Settings | Every setting `tvlink set` takes, as a form built from `tvlink keys --json`; values are checked by `tvlink set` and errors show beside the field; a change to the boot files says to reboot |
-| Actions | Reload Page, Identify, Take Screenshot, TV On and TV Off (by the power method, which the page names), Reboot (asks first, on the page), and Override: Force On or Force Off for a length (or until the next TV On or TV Off) or until a time, and Clear Override ([overrides](configuration.md#overrides)) |
+| Actions | Reload Page, Identify, Take Screenshot, TV On and TV Off (by the power method, which the page names), Reboot (asks first, on the page), and Override: Force On or Force Off for a length (or until the next TV On or TV Off) or until a time, and Clear Override ([overrides](configuration.md#overrides)); the read-only root's Turn On or Turn Off (asks first, on the page; takes a reboot) ([operations](operations.md#read-only-root-optional)) |
 | Logs | The last 200 lines of the kiosk, TV power and Wi-Fi network logs |
 | Wi-Fi | The `WIFI*` settings and the networks the unit can see |
 | Update | `tvlink update` with an archive URL and its SHA-256 ([operations](operations.md#updates)) |
@@ -43,7 +43,7 @@ keeps the current one, and Clear removes it.
 - **Privileges.** The console runs as its own system user, `tvlink-console`, in a systemd sandbox (read-only system,
   private `/tmp`, no home directories), with only the capability to bind port 80. It reaches root through sudo, for a
   fixed list of `tvlink` commands in `/etc/sudoers.d/tvlink-console` (`status`, `doctor`, `on`, `off`, `identify`,
-  `reload`, `screenshot`, `reboot`, `logs`, `set`, `update`, `override`). Arguments go to sudo as a list, never through a shell,
+  `reload`, `screenshot`, `reboot`, `logs`, `set`, `update`, `override`, `overlay`). Arguments go to sudo as a list, never through a shell,
   and sudo does not log them (`set` can carry a Wi-Fi password).
 - **Login.** One password per unit, stored as a PBKDF2-SHA256 hash (600,000 rounds) readable only by the console user.
   Sessions are in memory (a restart logs everyone out) and expire after 12 hours. The cookie is `HttpOnly` and
@@ -66,11 +66,12 @@ plus the `X-CSRF-Token` header on changes (every page sends the token in that re
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `tunnel` (`off`, `connected`, `not connected`), `content` (eg `USB stick, 3 files`, or `None`), `sync` (`off`, or the last sync, eg `OK 14:05: 4 files, 12 MB, unchanged`), `override` (eg `on until Tue 10 Nov 07:00`, or `none`), `uptime` (s), `health` (lines), `screenshot` (time taken, or null). `?brief=1`: `health` empty, in a fraction of the time |
+| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `tunnel` (`off`, `connected`, `not connected`), `content` (eg `USB stick, 3 files`, or `None`), `sync` (`off`, or the last sync, eg `OK 14:05: 4 files, 12 MB, unchanged`), `override` (eg `on until Tue 10 Nov 07:00`, or `none`), `overlay` (the read-only root: `on`, `off`, or eg `off, on after a reboot`), `uptime` (s), `health` (lines), `screenshot` (time taken, or null). `?brief=1`: `health` empty, in a fraction of the time |
 | `GET /api/settings` | | `version` and `keys`: `key`, `type` (`text`, `url`, `time`, `number`, `choice` with `choices`, `secret` with `set`), `label`, `hint`, `value`, `default` |
 | `POST /api/settings` | `{"KEY": "value", ...}` | `{"ok": true}`, or `400` with `error` and the `key` it is about |
 | `POST /api/action` | `{"action": "reload"}`: `reload`, `identify`, `screenshot`, `on`, `off` or `reboot` | `ok` and the command's `message` |
 | `POST /api/override` | `{"override": "on", "for": "4h"}`; `"until": "07:00"` instead of `for`; neither: until the next TV On or TV Off; `{"override": "clear"}` | `ok` and `message`, or `400` with `error` |
+| `POST /api/overlay` | `{"overlay": "on"}` or `off`: the read-only root from the next boot | `ok` and `message`, or `400` with `error` |
 | `GET /api/screenshot` | | The last screenshot (JPEG), or `404` |
 | `POST /api/screenshot` | | Takes one, then answers as GET |
 | `GET /api/logs?part=kiosk` | | `{"kiosk": "..."}`; without `part`: kiosk, power and net |

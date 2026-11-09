@@ -26,6 +26,7 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 | `sudo tvlink update URL SHA256` | Installs a commit of `main` (below) |
 | `sudo tvlink reboot` | Reboots in 3 s, as a planned reboot (`manual` mode does not wake the TV after it) |
 | `sudo tvlink console claim`, `sudo tvlink console reset` | The console's claim code; back to claim mode after a lost password |
+| `sudo tvlink overlay on\|off`, `tvlink overlay status` | The read-only root, from the next boot (below) |
 | `tvlink tunnel` | The tunnel: `off`, `connected` or `not connected` |
 | `sudo tvlink content sync`, `tvlink content status` | Sync `CONTENT_URL` now and print how it went; the last sync's result |
 | `tvlink content manifest DIR` | A manifest for the files in DIR, to serve with them ([synced content](configuration.md#synced-content)) |
@@ -131,8 +132,25 @@ halfway: `journalctl -u tvlink-update -f`.
 
 ## Read-only root (optional)
 
-Not recommended by default: security updates, network changes made outside tvlink.conf and the Connect sign-in all
-vanish at each reboot. Consider it only where power cuts keep corrupting cards. While online, run
-`sudo raspi-config nonint enable_overlayfs` and reboot; undo it with `disable_overlayfs`. Do not use `do_overlayfs`:
-it also write-protects the boot partition, which breaks `tvlink set` and local content. install.sh refuses to run
-under the overlay: turn it off, reboot, update, turn it on, reboot.
+Raspberry Pi OS's overlay file system keeps the root partition as it is at every boot: what is written goes to RAM
+and is gone at the next reboot, so a power cut can't damage the system. Consider it only where power cuts keep
+corrupting cards; it is off by default, as below. Switch it from the console's Actions page or a shell; either way
+it takes a reboot:
+
+```bash
+sudo tvlink overlay on       # raspi-config nonint enable_overlayfs; needs the network the first time (overlayroot)
+sudo tvlink reboot
+tvlink overlay status        # on, off, or eg "off, on after a reboot"
+sudo tvlink overlay off      # then reboot
+```
+
+It covers the root partition only, not the boot partition (that would be raspi-config's `do_overlayfs`, which tvlink
+does not use), so tvlink.conf, `tvlink set`, the console's Settings and Wi-Fi pages and the local content folder work
+as before. Set the unit up first. While it is on:
+
+| Kept | Gone at the next reboot | Refused or paused |
+| --- | --- | --- |
+| tvlink.conf and the boot partition's files; everything on the root partition from before it was turned on | Overrides, learned IR codes, a console password or API tokens made while on, the hourly last good screen, the Raspberry Pi Connect sign-in, network changes made outside tvlink.conf | `tvlink update` and install.sh (turn it off, reboot, update, turn it on, reboot); `TUNNEL_TOKEN` changes; content sync (the set from before plays); nightly security updates (the reboot would undo them, and they would fill RAM first) |
+
+`tvlink doctor` and the console's Status page show it; `tvlink override` and `tvlink ir learn` say when what they
+keep won't last.

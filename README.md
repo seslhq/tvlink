@@ -39,7 +39,8 @@ through power cuts, network drops and browser crashes without a site visit.
 - **A steady HDMI link.** Optional forced hotplug and a captured EDID, so a TV that is off or on another input at
   boot still gets the right picture.
 - **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
-  and security updates staged so a few units take them first.
+  and security updates staged so a few units take them first. Where power cuts keep damaging cards, an optional
+  read-only root, switched from the console.
 - **A console on every unit.** Web pages and a JSON API on the unit itself: the screen, health, settings, actions,
   logs, Wi-Fi, updates and API tokens, from a phone on site or through a tunnel. Claimed with a one-time code from
   the TV ([docs/console.md](docs/console.md)).
@@ -101,7 +102,7 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 ## Try it without a Pi
 
 On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi,
-the motion sensor and a USB stick, and runs 232 checks against the real services: [docs/testing.md](docs/testing.md).
+the motion sensor and a USB stick, and runs 254 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 

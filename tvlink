@@ -2,7 +2,7 @@
 # tvlink: show the splash until the board answers, run it full screen, turn the TV on and off.
 # Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|reboot|update|set KEY=value...|console claim|reset
 #        tvlink ir learn|test on|off, tvlink edid capture|clear, tvlink content sync|status|manifest DIR
-#        tvlink override [on|off [DURATION|until HH:MM]|clear]
+#        tvlink override [on|off [DURATION|until HH:MM]|clear], tvlink overlay on|off|status
 #        (services and the console use check, kiosk, browser, net, mode, keys --json, logs, tunnel, usb, lastgood;
 #        install.sh boot)
 # SPDX-License-Identifier: Apache-2.0
@@ -435,7 +435,8 @@ ir() {
       [ "$(grep -c . "$f.tmp")" -ge 16 ] && [ "$(head -c 5 "$f.tmp")" = pulse ] ||
         { rm -f "$f.tmp"; die "Nothing usable received: try again, closer to the receiver"; }
       mv -f "$f.tmp" "$f" || die "Can't write $f"
-      echo "Learned power $2: $(grep -c . "$f") pulses and spaces in $f. Use them: sudo tvlink set IR_CODES=learned" ;;
+      echo "Learned power $2: $(grep -c . "$f") pulses and spaces in $f. Use them: sudo tvlink set IR_CODES=learned"
+      ! overlay_on || echo "The read-only root is on: learned codes are gone at the next reboot" ;;
     test) ir_send "$2" ;;
     *) die "Usage: sudo tvlink ir learn|test on|off" ;;
   esac
@@ -473,6 +474,43 @@ net() {
 # The HDMI hotplug and EDID arguments of a kernel command line, sorted.
 hdmi_args() { grep -oE '(vc4\.force_hotplug|drm\.edid_firmware)=[^ ]*' "$1" 2>/dev/null | sort | paste -sd' ' -; }
 
+# The read-only root: raspi-config's overlay file system over the root partition only (enable_overlayfs, not
+# do_overlayfs, which also locks the boot partition and so tvlink.conf). Whether it is on now.
+overlay_on() { grep -q ' / overlay ' /proc/mounts 2>/dev/null; }
+
+# Turn it on or off from the next boot, or say how it is: on, off, or eg "off, on after a reboot".
+overlay() {
+  local now=off next out
+  case ${1:-status} in
+    on | off)
+      [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink overlay $1"
+      command -v raspi-config >/dev/null || die "No raspi-config: the read-only root needs Raspberry Pi OS"
+      out=$(raspi-config nonint "$([ "$1" = on ] && echo enable || echo disable)_overlayfs" 2>&1) ||
+        die "raspi-config can't turn it $1: $out"
+      # enable_overlayfs installs overlayroot and carries on if it can't (eg offline): undo, rather than say on
+      if [ "$1" = on ] && ! dpkg-query -W -f '${Status}' overlayroot 2>/dev/null | grep -q 'ok installed'; then
+        raspi-config nonint disable_overlayfs >/dev/null 2>&1
+        die "Can't install overlayroot (no network?): the read-only root stays off"
+      fi ;;
+    status) ;;
+    *) die "Usage: tvlink overlay on|off|status" ;;
+  esac
+  overlay_on && now=on
+  next=$now
+  if command -v raspi-config >/dev/null; then
+    if [ "$(raspi-config nonint get_overlay_conf 2>/dev/null)" = 0 ]; then next=on; else next=off; fi
+  fi
+  case ${1:-status}:$now:$next in
+    status:*) if [ "$now" = "$next" ]; then echo "$now"; else echo "$now, $next after a reboot"; fi
+      command -v raspi-config >/dev/null || echo "No raspi-config: turning it on or off needs Raspberry Pi OS" >&2 ;;
+    on:on:on | off:off:off) echo "The read-only root is $1, now and after a reboot" ;;
+    on:*) echo "The read-only root is on after a reboot: sudo tvlink reboot. Then changes outside tvlink.conf last" \
+      "only until the next reboot (overrides, learned IR codes, the console's password and API tokens); content" \
+      "sync pauses, and updates and the tunnel token wait until it is off." ;;
+    off:*) echo "The read-only root is off after a reboot: sudo tvlink reboot" ;;
+  esac
+}
+
 # Health on one screen, for remote support and the hardware checklist. Read-only; sudo adds the CEC and IR answers.
 doctor() {
   local host=${BOARD_URL#*://} dev hp pend edids src files
@@ -509,8 +547,8 @@ doctor() {
   echo "Wi-Fi: $(nmcli -t -f NAME connection show --active 2>/dev/null | paste -sd' ' -)," \
     "$(iw dev wlan0 get power_save 2>/dev/null)"
   echo "Tunnel: $(tunnel_state)"
-  echo "Watchdog: $(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)," \
-    "root $(grep -q ' / overlay ' /proc/mounts 2>/dev/null && echo read-only || echo writable)"
+  echo "Watchdog: $(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null), read-only root $(overlay status \
+    2>/dev/null)"
   echo "Versions: $(dpkg-query -W -f '${Package} ${Version}, ' cage chromium wlr-randr v4l-utils 2>/dev/null)"
 }
 
@@ -736,6 +774,8 @@ screenshot() {
 update() {
   local url=${1:-} sum=${2:-} dir inst
   [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink update URL SHA256"
+  ! overlay_on || die "The read-only root is on, so an update would be gone at the next reboot: turn it off" \
+    "(sudo tvlink overlay off), reboot, update, then turn it on and reboot"
   [[ $url =~ ^https:// && $sum =~ ^[0-9a-f]{64}$ ]] || die "Usage: sudo tvlink update https://.../tvlink.tar.gz SHA256"
   dir=$(mktemp -d /var/tmp/tvlink-update.XXXXXX) || die "Can't make a working folder"
   # shellcheck disable=SC2064 # expand now: dir is local and may be gone when the trap runs
@@ -840,7 +880,9 @@ set_conf() {
       WIFI?_PSK) [[ -z $value || ${#value} -ge 8 && ${#value} -le 63 ]] ||
         die "$key is 8 to 63 characters, or blank for an open network" ;;
       # base64 of JSON with the account (a), tunnel (t) and secret (s)
-      TUNNEL_TOKEN) [[ -z $value || ($value =~ ^[A-Za-z0-9+/=_-]{40,4096}$ &&
+      TUNNEL_TOKEN) ! overlay_on || die "TUNNEL_TOKEN is kept on the root partition, which is read-only now: turn" \
+        "it off (sudo tvlink overlay off) and reboot first"
+        [[ -z $value || ($value =~ ^[A-Za-z0-9+/=_-]{40,4096}$ &&
         $(base64 -d <<<"$value" 2>/dev/null) == *'"t":'*) ]] ||
         die "TUNNEL_TOKEN is the tunnel's token from Cloudflare (eyJ...), or blank to turn the tunnel off" ;;
     esac
@@ -915,9 +957,11 @@ case $1 in
   content) content_cmd "${2:-}" "${3:-}" ;;
   lastgood) lastgood ;;
   edid) edid "${2:-}" ;;
+  overlay) overlay "${2:-}" ;;
   override) # the TV forced on or off over the power mode until a time; tvlink-power keeps the logic and honours it
     [ "$(id -u)" = 0 ] || die "Run as root: sudo tvlink override [on|off [DURATION|until HH:MM]|clear]"
     shift
+    [ $# = 0 ] || ! overlay_on || echo "The read-only root is on: this lasts until the next reboot at most"
     exec "${0%/*}/tvlink-power" override "$@" ;;
   boot) boot ;;
   reboot) # planned, so POWER_MODE=manual does not wake the TV after it; in 3 s, so the console can answer first
@@ -926,5 +970,5 @@ case $1 in
     systemd-run --quiet --collect --on-active=3 /bin/systemctl reboot && echo "Rebooting in 3 s" ;;
   *) die "Usage: tvlink show|doctor|on|off|status|identify|screenshot|reload|reboot|update URL SHA256|\
 set KEY=value...|console claim|reset|ir learn|test on|off|edid capture|clear|content sync|status|manifest DIR|\
-override [on|off [DURATION|until HH:MM]|clear]" ;;
+override [on|off [DURATION|until HH:MM]|clear]|overlay on|off|status" ;;
 esac

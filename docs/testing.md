@@ -17,7 +17,7 @@ python3 tvlink-content test
 The self-tests cover the settings parser (through `tvlink show`, including `CEC=0` as `POWER_METHOD=none`), the power
 modes, presence and clock logic (including clock changes), every power mode with every power method through a day
 (no re-wake loop with IR), overrides (over each mode through a day, their end by length, time or the next on-hours boundary across clock
-changes, the root-only file, the console's arguments), the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
+changes, the root-only file, the console's arguments), the read-only root's state from the next boot, the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
 tokens, login rate limit (and the visitor's address through a tunnel), settings forms, power methods and API tokens;
 the daily browser restart's timing (once on the day clocks go back, an hour late when they go forward, never in the
 first hour after boot or while dark); synced content's manifest checks, https-only redirects, and syncs against a
@@ -112,6 +112,12 @@ tests/vm.sh
   planted in its place not followed; with the board down after a kiosk restart, the splash shows it full screen with
   the red Offline marker; `LAST_GOOD=0` deletes it;
 - the daily browser restart: a new Chromium at `BROWSER_RESTART` in the same cage, and the page back;
+- the read-only root: raspi-config from the Raspberry Pi repo (`raspi-config-core`); `tvlink overlay on` installs
+  overlayroot and puts `overlayroot=tmpfs` in `cmdline.txt` once (kept by `tvlink boot`), status says it is on after
+  a reboot, the console shows it and offers Turn Off, which the API then does. The VM boots its own kernel command
+  line, not `cmdline.txt`, so the overlay boot itself is simulated: a chroot whose root is a real overlay over the
+  VM's, as overlayroot mounts it. There `tvlink overlay status` says it is on, and `tvlink update`, install.sh and
+  `TUNNEL_TOKEN` refuse, and apt's units would be skipped;
 - HDMI at boot: `HDMI_FORCE_HOTPLUG` adds and removes `vc4.force_hotplug=1` once, leaving the rest of `cmdline.txt`,
   and a second set changes nothing; `tvlink edid capture` refuses the VM's own display (no EDID) and a corrupt EDID,
   saves the stand-in's byte for byte, adds `drm.edid_firmware` once and the file to the initramfs; `clear` removes
@@ -165,6 +171,10 @@ or after a change that touches them, check on the bench with a fresh card and re
 - A 72 h soak on 1 GB with a real page: lowest available memory, zram use, OOM kills, temperature,
   `vcgencmd get_throttled`; `/home/kiosk` still empty and `du -sh /run/tvlink` small (the GPU's shader cache).
 - Connect survives a reboot and a power cut; `wdctl` shows the watchdog; Wi-Fi power save is off.
+- Read-only root on a Pi 5: `tvlink overlay on` from the console, reboot: `findmnt /` says overlay, `tvlink set` and
+  the console's Settings still save to tvlink.conf, a file written to `/var/lib/tvlink` is gone after a reboot, the
+  nightly security update is skipped, `tvlink update` refuses; 20 power cuts mid-page with it on; then
+  `tvlink overlay off`, reboot, and an update works.
 - Overrides: `tvlink override off until` a time across the nightly reboot and a power cut, and `on` through a clock
   change; each ends on time and the mode takes over (`schedule` turns the TV back, `manual` leaves it).
 - Motion: a PIR wakes the TV outside on-hours and standby follows after `IDLE_MIN`; `manual+motion` wakes on arrival
