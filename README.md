@@ -6,8 +6,8 @@
 # tvlink
 
 Set-and-forget digital signage for consumer TVs. A Raspberry Pi 5 shows one web page, dashboard or folder of images
-and videos full screen on a TV, turns the TV on and off over HDMI-CEC, and keeps going through power cuts, network
-drops and browser crashes without a site visit.
+and videos full screen on a TV, turns the TV on and off (HDMI-CEC, infrared or the HDMI signal), and keeps going
+through power cuts, network drops and browser crashes without a site visit.
 
 ![A dashboard full screen on the TV, with the live badge in the bottom-right corner](docs/images/board.jpg)
 
@@ -28,7 +28,9 @@ drops and browser crashes without a site visit.
 
 - **Local content.** Images, videos or an `index.html` on the SD card play with no network, as a fallback or on
   their own.
-- **TV power over HDMI-CEC.** Always on, on-hours, a motion sensor, the TV remote, or the remote plus motion wake.
+- **TV power three ways.** HDMI-CEC; infrared with built-in discrete codes for common brands or codes learned from
+  the TV's remote; or the HDMI signal off and on, for TVs that sleep without one. Always on, on-hours, a motion
+  sensor, the TV remote, or the remote plus motion wake, with any of them.
 - **Looks after itself.** Nightly reboot (skipped while the page is down, so the last good screen stays), watchdog,
   and security updates staged so a few units take them first.
 - **A console on every unit.** Web pages and a JSON API on the unit itself: the screen, health, settings, actions,
@@ -51,10 +53,12 @@ drops and browser crashes without a site visit.
 
 ```
 TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
+    <───── IR ───────  optional: an IR LED on a GPIO pin
                          tvlink.service          cage + Chromium on tty1: splash until the page answers, then the
                                                  page; tvlink-agent drives Chromium over a DevTools pipe (badge,
                                                  recovery)
-                         tvlink-power.service    TV power over CEC: schedule, motion sensor, power-cut wake
+                         tvlink-power.service    TV power over CEC, IR or the HDMI signal: schedule, motion sensor,
+                                                 power-cut wake
                          tvlink-net.service      Wi-Fi networks from the settings file
                          tvlink-console.service  the console on port 80: web pages and JSON API
                          tvlink-tunnel.service   optional: cloudflared, a Cloudflare Tunnel to the console
@@ -68,7 +72,7 @@ thing listening on the network is the console. The design and the reasons behind
 ## Quick start
 
 You need a Raspberry Pi 5 (1 GB is enough) with the official 27 W power supply and Active Cooler, a high-endurance
-microSD card, a micro-HDMI cable, and a TV with HDMI-CEC turned on.
+microSD card, a micro-HDMI cable, and a TV with HDMI-CEC turned on (or an IR LED: [setup](docs/setup.md)).
 
 1. Write Raspberry Pi OS Lite (64-bit, Trixie) with Raspberry Pi Imager; set the hostname, a user, SSH with a key,
    and Wi-Fi if there is no Ethernet.
@@ -87,15 +91,15 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 
 ## Try it without a Pi
 
-On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC), Wi-Fi and the
-motion sensor, and runs 103 checks against the real services: [docs/testing.md](docs/testing.md).
+On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi
+and the motion sensor, and runs 140 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
 | Guide | Covers |
 | --- | --- |
-| [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor |
-| [Configuration](docs/configuration.md) | Every setting, power modes, local content |
+| [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, wiring a motion sensor and IR |
+| [Configuration](docs/configuration.md) | Every setting, power modes and methods, local content |
 | [Console](docs/console.md) | The unit's web pages and JSON API, claiming, security |
 | [Cloudflare](docs/cloudflare.md) | A tunnel per unit, Access in front, a service token for the fleet console |
 | [Fleet](docs/fleet.md) | The fleet console: installing it on a server, adding units, security |

@@ -11,10 +11,12 @@ Started by `tvlink browser` inside cage, as the kiosk user. It runs Chromium wit
 - recovers a crashed or frozen tab, or a Chromium error page, by going back to the splash, which hands over again once
   the board answers; at most once a minute. After 3 recoveries in 10 min it exits: cage exits and systemd restarts
   the kiosk with a fresh browser.
-Every 30 s it runs `tvlink mode`, which sets the HDMI mode again if the TV came back at its own (hotplug in
-standby). It also takes one-word requests from the tvlink CLI in /run/tvlink/request: identify (name and IP big
-on screen for up to 60 s, or until the page reloads; also the console's claim code while it has one), screenshot
-(JPEG to /run/tvlink/screen.jpg) and reload. It sends no CEC and needs no root.
+After start and every 30 s it runs `tvlink mode`, which sets the HDMI mode again if the TV came back at its own
+(hotplug in standby), and turns the outputs off or on as root last asked (POWER_METHOD=signal). It also takes
+requests from the tvlink CLI in /run/tvlink/request: identify (name and IP big on screen for up to 60 s, or until the
+page reloads; also the console's claim code while it has one), screenshot (JPEG to /run/tvlink/screen.jpg), reload,
+and display on|off (run `tvlink mode` now). While the signal is off it skips the health check: a dark screen is not a
+fault. It sends no CEC and needs no root.
 """
 import base64
 import fcntl
@@ -32,6 +34,7 @@ STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
 SPLASH = os.environ.get("TVLINK_SPLASH", "file:///usr/share/tvlink/splash.html")
 REQUEST = os.path.join(os.path.dirname(STATUS), "request")  # one word from `tvlink identify|screenshot|reload`
 SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
+SIGNAL = os.environ.get("TVLINK_SIGNAL", "/run/tvlink-display")  # root's: off while POWER_METHOD=signal has it off
 SYNCED = os.environ.get("TVLINK_SYNCED", "/run/systemd/timesync/synchronized")  # timesyncd: NTP synced this boot
 RTC = "/sys/class/rtc/rtc0/since_epoch"
 CLOCK_FLOOR = 1793491200  # 2026-11-01, as in tvlink-power
@@ -96,6 +99,14 @@ def take_request(path=REQUEST):
         return request
     except OSError:
         return ""
+
+
+def dark(path=SIGNAL):
+    try:
+        with open(path) as f:
+            return f.read(8).strip() == "off"
+    except OSError:
+        return False
 
 
 def settings(cli=CLI):
@@ -220,7 +231,7 @@ def main(argv):
     browser = Browser(argv)
     session = browser.attach()
     last_ok, recoveries, next_push, next_health, shown = None, [], 0.0, time.monotonic() + HEALTH, None
-    hung, misses, href, page_status, next_mode = False, 0, "", 0, time.monotonic() + MODE
+    hung, misses, href, page_status, next_mode = False, 0, "", 0, 0.0  # mode now: the signal off, if it is
     while True:
         crashed = False
         try:
@@ -254,12 +265,16 @@ def main(argv):
                     name += f"\nConsole code {status['claim']}"
                 browser.send("Runtime.evaluate", {"expression": IDENTIFY % json.dumps(name), "returnByValue": True},
                              session)
+            elif request in ("display on", "display off"):
+                next_mode = 0.0  # below, this tick
             if request:
                 print(f"Request: {request}", flush=True)
         except (queue.Empty, RuntimeError, OSError, KeyError, ValueError) as e:
             print(f"Request {request} failed: {e}", flush=True)
         if status.get("state") == "ready" and written:
             last_ok = time.strftime("%H:%M", time.localtime(written))
+        if dark():  # the outputs are off on purpose: a page that does not answer then is no fault
+            next_health, misses = now + HEALTH, 0
         if not crashed and now >= next_health:
             next_health = now + HEALTH
             try:
@@ -342,6 +357,12 @@ def test():
         with open(req, "w") as f:
             f.write("screenshot\n")
         assert take_request(req) == "screenshot" and take_request(req) == ""  # runs once
+        sig = os.path.join(tmp, "display")
+        assert not dark(sig)
+        for word, off in (("off\n", True), ("on\n", False)):
+            with open(sig, "w") as f:
+                f.write(word)
+            assert dark(sig) == off
     print("ok")
 
 

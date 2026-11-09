@@ -17,6 +17,7 @@ within() { # seconds command...: retry until it passes
   until "$@"; do ((n-- > 0)) || return 1; sleep 1; done
 }
 says() { grep -q "$1" <<<"$out"; }
+no() { ! "$@"; }
 quiet() { "$@" >/dev/null 2>&1; }
 tv_is() { [ "$(tvlink status)" = "$1" ]; }
 on_wifi() { nmcli -t -f DEVICE,STATE,CONNECTION device | grep -qx "wlan0:connected:$1"; }
@@ -27,7 +28,11 @@ echo "== Install and self-tests"
 check "tvlink-power test" quiet python3 tvlink-power test
 check "tvlink-agent test" quiet python3 tvlink-agent test
 check "tvlink-console test" quiet python3 tvlink-console test
-for u in tvlink tvlink-power tvlink-net tvlink-console; do check "$u running" systemctl -q is-active "$u"; done
+# Settings the checks change, as an earlier run that stopped midway may have left them
+tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned >/dev/null
+for u in tvlink tvlink-power tvlink-net tvlink-console; do
+  check "$u running" within 10 systemctl -q is-active "$u"
+done
 
 echo "== TV over HDMI-CEC"
 # vivid's HDMI input is the TV and its HDMI output the Pi, cabled together; cec-follower answers as the TV. The TV
@@ -73,6 +78,60 @@ echo 1 >/run/pir17
 check "motion after the quiet minute wakes the TV" within 15 tv_is on
 echo 0 >/run/pir17
 tvlink set POWER_MODE=schedule IDLE_MIN=15 >/dev/null
+
+echo "== TV power by infrared (rc-loopback for the IR LED, the receiver and the TV)"
+# What is sent on rc-loopback's /dev/lirc0 comes back on it, and the kernel decodes it to scancodes on its input
+# device: heard lists those, so a check sees what reached the TV, as a TV would decode it.
+modprobe rc-loopback
+for r in /sys/class/rc/rc*; do grep -qx DRV_NAME=rc-loopback "$r/uevent" && lirc=$r; done
+echo "+nec +sony" >"$lirc/protocols"
+scan='import glob, os, select, struct, sys, time
+fd = os.open("/dev/input/" + glob.glob(sys.argv[1] + "/input*/event*")[0].rsplit("/")[-1], os.O_RDONLY | os.O_NONBLOCK)
+end, seen = time.time() + 6, []
+while time.time() < end:
+    if select.select([fd], [], [], 0.2)[0]:
+        data = os.read(fd, 24 * 64)
+        for i in range(0, len(data), 24):
+            kind, code, value = struct.unpack("llHHi", data[i:i + 24])[2:]
+            if (kind, code) == (4, 4) and hex(value & 0xffffffff) not in seen:  # EV_MSC, MSC_SCAN
+                seen.append(hex(value & 0xffffffff))
+print(" ".join(seen))'
+heard() { # command...: the scancodes decoded while it runs, and up to 6 s from its start
+  python3 -c "$scan" "$lirc" >/run/ir-heard &
+  sleep 0.5
+  "$@" >/dev/null 2>&1
+  wait $!
+  cat /run/ir-heard
+}
+# manual: a restart that is not after a power cut sends nothing, so only the checks send
+tvlink set POWER_MODE=manual POWER_METHOD=ir IR_CODES=samsung >/dev/null
+check "IR transmitter overlay in config.txt" grep -qx 'dtoverlay=gpio-ir-tx,gpio_pin=18' /boot/firmware/config.txt
+check "... and the receiver's, mapping no keys" \
+  grep -qx 'dtoverlay=gpio-ir,gpio_pin=23,rc-map-name=rc-empty' /boot/firmware/config.txt
+check "IR: status unknown" tv_is unknown
+for b in "samsung 0x70799 0x70798" "lg 0x4c4 0x4c5" "sony 0x1002e 0x1002f" "toshiba 0x407e 0x407f"; do
+  read -r brand on off <<<"$b"
+  tvlink set IR_CODES="$brand" >/dev/null
+  check "IR $brand: on" test "$(heard tvlink on)" = "$on"
+  check "IR $brand: off" test "$(heard tvlink off)" = "$off"
+done
+out=$(tvlink set IR_CODES=panasonic 2>&1); check "IR: a brand without built-in codes refused" says 'IR_CODES is'
+rm -rf /var/lib/tvlink/ir
+learn() { # on|off scancode: learn from a stand-in remote sending the scancode
+  tvlink ir learn "$1" >/run/ir-learn 2>&1 &
+  sleep 1.5
+  ir-ctl -d /dev/lirc0 -S "nec:$2"
+  wait $!
+}
+learn on 0x1234; check "IR learn on" grep -q '^Learned power on' /run/ir-learn
+learn off 0x1235; check "IR learn off" grep -q '^Learned power off' /run/ir-learn
+check "... kept root only" test "$(stat -c '%U %a' /var/lib/tvlink/ir)" = "root 700"
+tvlink set IR_CODES=learned >/dev/null
+check "IR learned: on" test "$(heard tvlink ir test on)" = 0x1234
+check "IR learned: off" test "$(heard tvlink ir test off)" = 0x1235
+check "tvlink-power with IR: always sends on at start" test "$(heard tvlink set POWER_MODE=always)" = 0x1234
+tvlink set POWER_METHOD=cec POWER_MODE=schedule >/dev/null
+check "back to CEC: the IR overlays go" quiet test "$(grep -c gpio-ir /boot/firmware/config.txt)" = 0
 
 echo "== Wi-Fi"
 # Three hwsim radios: wlan0 is the Pi's; wlan1 and wlan2 move to their own namespace as the site's access points.
@@ -154,6 +213,7 @@ web /login >/dev/null
 check "login refuses a wrong password" test "$(web -d "csrf=$(csrf)" -d password=wrong-password /login)" = 401
 check "login works" test "$(web -d "csrf=$(csrf)" -d password=vm-test-password /login)" = 303
 check "logged in: Status page" test "$(web /)" = 200
+check "... shows the power method" grep -q '<dd>[A-Za-z]* (HDMI-CEC)</dd>' "$c/body"
 t=$(csrf)
 check "a form without its CSRF token is refused" test "$(web -d action=identify /actions)" = 403
 check "API with a session but no CSRF header is refused" test "$(web -d '{"action":"identify"}' /api/action)" = 403
@@ -277,6 +337,43 @@ rm -f "$c/fjar"
 check "fleet: refused without a login" test "$(fweb /u/vm-unit/)" = 303
 web -H "X-CSRF-Token: $t" -X DELETE /api/tokens/vm-fleet >/dev/null
 systemctl stop tvlink-fleet
+
+echo "== TV power by HDMI signal (cage's output off and on)"
+enabled() { # outputs cage has on
+  runuser -u kiosk -- env XDG_RUNTIME_DIR="/run/user/$(id -u kiosk)" WAYLAND_DISPLAY=wayland-0 wlr-randr |
+    grep -c 'Enabled: yes'
+}
+signal_is() { [ "$(enabled)" = "$1" ]; }
+power_said() { journalctl -q -u tvlink-power --since "$since" | grep -q "$1"; }
+since=$(date '+%F %T')
+tvlink set POWER_METHOD=signal POWER_MODE=always >/dev/null
+check "signal: tvlink-power turns it on at start (always)" within 20 power_said 'HDMI signal on'
+systemctl stop tvlink-power # its 5-minute check would turn it back on mid-check
+check "signal: status on" tv_is on
+cage=$(pgrep -u kiosk -o -x cage)
+since=$(date '+%F %T')
+out=$(tvlink off); check "signal off" says 'HDMI signal off'
+check "... the output is off" within 10 signal_is 0
+check "... status off" tv_is off
+web /api/status >/dev/null
+check "... the console says Off (HDMI Signal)" test "$(field tv)/$(field method)" = off/signal
+web /actions >/dev/null
+check "... and what TV On does with it" grep -q 'Turns the HDMI signal on' "$c/body"
+sleep 65 # two health checks and two mode passes
+check "... still off after a minute" signal_is 0
+check "... the kiosk kept running" test "$(pgrep -u kiosk -o -x cage)" = "$cage"
+check "... a dark screen is no fault" quiet test "$(journalctl -q -t tvlink --since "$since" | grep -c Recover)" = 0
+since=$(date '+%F %T')
+systemctl restart tvlink
+check "a kiosk restart keeps it off" within 60 logged 'HDMI signal off'
+check "... the page loads first" logged 'Badge: live'
+check "... output off" within 5 signal_is 0
+since=$(date '+%F %T')
+out=$(tvlink on); check "signal on" says 'HDMI signal on'
+check "... the output is on" within 10 signal_is 1
+check "... status on" tv_is on
+out=$(tvlink screenshot); check "... and the page shows" says Saved
+tvlink set POWER_METHOD=cec POWER_MODE=schedule >/dev/null
 
 echo "== $fails failed"
 [ "$fails" = 0 ]

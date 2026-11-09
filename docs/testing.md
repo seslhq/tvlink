@@ -13,18 +13,19 @@ python3 tvlink-agent test
 python3 tvlink-console test
 ```
 
-The self-tests cover the settings parser (through `tvlink show`), the power modes, presence and clock logic (including
-clock changes), the badge, and the console's password hashing, sessions, CSRF tokens, login rate limit (and the
-visitor's address through a tunnel), settings forms and API tokens; and the fleet console's unit checks, its calls to
-stand-in units (the tokens it sends, redirects refused, each failure's message), the overview not waiting on a slow
-or dead unit, and its badges.
+The self-tests cover the settings parser (through `tvlink show`, including `CEC=0` as `POWER_METHOD=none`), the power
+modes, presence and clock logic (including clock changes), every power mode with every power method through a day
+(no re-wake loop with IR), the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
+tokens, login rate limit (and the visitor's address through a tunnel), settings forms, power methods and API tokens;
+and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each
+failure's message), the overview not waiting on a slow or dead unit, and its badges.
 
 ## The VM
 
 `tests/vm.sh` runs tvlink in a Linux VM on an Apple silicon Mac, using the real `install.sh`, systemd units, cage,
-Chromium, NetworkManager and `cec-ctl`. Linux's own test drivers stand in for the TV and the Wi-Fi, and gpiozero's
-mock pins for the motion sensor. Run it after a change to install.sh, the units, CEC, Wi-Fi or the kiosk; if you
-can't, say so in the pull request.
+Chromium, NetworkManager, `cec-ctl` and `ir-ctl`. Linux's own test drivers stand in for the TV (CEC and IR) and the
+Wi-Fi, and gpiozero's mock pins for the motion sensor. Run it after a change to install.sh, the units, TV power,
+HDMI, Wi-Fi or the kiosk; if you can't, say so in the pull request.
 
 ```bash
 brew install lima
@@ -46,6 +47,7 @@ tests/vm.sh
 | TV on HDMI-CEC | `vivid`: its HDMI input is the TV, its output is the Pi, and `cec-follower` acts as the TV. The TV side's node is moved to `/dev/tvside`, so tvlink sees one adapter | `tv` in `tests/vm-test.sh` |
 | Site Wi-Fi | `mac80211_hwsim`: `wlan0` is the Pi's radio; two access points run in the `ap` network namespace: `tvlink-open` (open) and `tvlink-hidden` (hidden, WPA2) | `ip netns exec ap ...` |
 | Ethernet unplugged | `ip route del default dev eth0`; plug it back in with `networkctl reconfigure eth0` | |
+| IR LED, receiver and the TV's IR sensor | `rc-loopback`: what is sent on `/dev/lirc0` comes back on it, and the kernel's NEC and Sony decoders turn it into scancodes on its input device | `ir-ctl -d /dev/lirc0 -S nec:0x1234` (a remote) |
 | Motion sensor | gpiozero's MockFactory, through a tvlink-power drop-in; GPIO17 follows the line written to the FIFO | `echo 1 >/run/pir17` (motion), `echo 0` (quiet) |
 | Board | `python3 -m http.server` on 127.0.0.1:8080 | `systemctl stop tvlink-test-board` |
 | GPU | wlroots software renderer (`WLR_RENDERER=pixman` drop-in) | |
@@ -58,6 +60,9 @@ tests/vm.sh
 - an unplugged TV;
 - a TV that drops hotplug in standby;
 - motion wake in `manual+motion`;
+- IR: the transmitter and receiver overlays in `config.txt` (gone again with `cec`), status `unknown`, each built-in
+  brand's on and off codes decoded as sent, a brand without codes refused, learning on and off from a stand-in remote
+  (stored root-only) and sending them, and tvlink-power sending the on code at start;
 - Wi-Fi join, Wi-Fi country, a rerun that leaves the link up, power save, fallback to the hidden WPA network, and the
   Ethernet-out network check;
 - the splash handing over to the board, the live badge, and a screenshot;
@@ -79,7 +84,10 @@ tests/vm.sh
 - the fleet console: on loopback only, a root-only claim code, claimed; this unit added with an API token (stored for
   the fleet user only) and an unreachable one (`192.0.2.1`); the overview shows the unit Live and the other
   Unreachable without waiting on it; the screenshot, Status (with health), Settings (a bad value's error) and Logs
-  pages through the fleet; a Reload through it reaches the TV; nothing without a login.
+  pages through the fleet; a Reload through it reaches the TV; nothing without a login;
+- the HDMI signal: tvlink-power turns it on at start, `tvlink off` turns cage's output off and `tvlink on` back on,
+  status and the console follow, the kiosk keeps running and logs no recovery for a minute in the dark, a kiosk
+  restart keeps it off, and the page shows again after.
 
 Faults to try by hand, as root in the VM (the power cut runs on the Mac):
 - **TV unplugged at the wall:** `pkill cec-follower; cec-ctl -d /dev/tvside --clear`.
@@ -109,6 +117,12 @@ or after a change that touches them, check on the bench with a fresh card and re
   slideshow).
 - Each TV model: `tvlink on`, `off` and `status`; wake time; auto standby can be turned off; `sudo cec-ctl -M` during
   repeated `tvlink on` shows no on-screen banners.
+- IR on a Pi 5: the `gpio-ir-tx` and `gpio-ir` overlays load (`sudo tvlink doctor` names a transmitter and receiver);
+  each built-in brand's codes on a TV of that brand from a few centimetres and across the room; learning on and off
+  from a real remote, then `IR_CODES=learned`; the remote pressed near the receiver types nothing into the kiosk;
+  `schedule` with IR across an on-time start and end, and a power cut in off-hours.
+- Signal: on a TV that sleeps without a signal, `tvlink off` puts it to sleep and `tvlink on` wakes it; how long it
+  takes; the page and badge after a night dark; a kiosk restart and the nightly reboot while dark (the TV may wake).
 - TV standby with the Pi running: does it drop hotplug, and are the CEC address and picture size right after a wake.
 - A 4K TV: the default `1920x1080@60` holds after boot and after a wake; `RESOLUTION=auto` runs 4K.
 - 10 power cuts mid-page: it recovers by itself, the settings file is intact, one standby in off-hours, and `manual`

@@ -52,6 +52,13 @@ SESSION_TTL, ANON_TTL, MAX_ANON = 12 * 3600, 3600, 500  # anonymous sessions onl
 TRIES, WINDOW = 5, 300  # failed logins or claims per client per 5 min; four times that from everyone
 ACTIONS = ("reload", "identify", "screenshot", "on", "off", "reboot")
 LOGS = ("kiosk", "power", "net")
+# POWER_METHOD: its name, and what TV On and TV Off do with it
+METHODS = {"cec": ("HDMI-CEC", "Wakes the TV over HDMI-CEC and switches it to the Pi.", "Puts the TV in standby."),
+           "ir": ("Infrared", "Sends the TV's power on code by infrared.",
+                  "Sends the TV's power off code by infrared."),
+           "signal": ("HDMI Signal", "Turns the HDMI signal on: the TV wakes when it sees one.",
+                      "Turns the HDMI signal off: the TV sleeps when it has none."),
+           "none": ("None", "Does nothing: Power Method is none.", "Does nothing: Power Method is none.")}
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I, O, 0 or 1
 STATES = {"ready": "Live", "folder": "Local Content", "setup": "Ready to Set Up", "network": "No Network",
           "waiting": "Can't Reach the Board", "empty": "No Files to Show", "starting": "Starting"}
@@ -236,7 +243,7 @@ def save(changes):
             return False, f"Unknown setting: {k}", None
     ok, out, err = tvlink("set", *(f"{k}={v}" for k, v in changes.items()), timeout=300)  # a first tunnel: apt
     if ok:
-        return True, "Saved", None
+        return True, " ".join(["Saved."] + [line for line in out.splitlines() if line.startswith("Reboot")]), None
     msg = err or out or "Can't save"
     return False, msg, error_key(msg, changes)
 
@@ -281,9 +288,14 @@ def duration(secs):
     return f"{d} d {h} h" if d else f"{h} h {m} min" if h else f"{m} min"
 
 
+def power_method(sch):
+    """POWER_METHOD from a schema, as tvlink resolved it."""
+    return next((k.get("value") for k in sch.get("keys", []) if k.get("key") == "POWER_METHOD"), None) or "cec"
+
+
 def status(brief=False):
     """The unit's state; brief: without doctor's health lines, which can take seconds (the fleet page)."""
-    s = read_status()
+    s, sch = read_status(), schema()
     _, tv, _ = tvlink("status", timeout=30)
     _, tunnel, _ = tvlink("tunnel", root=False, timeout=10)
     _, doctor, err = (True, "", "") if brief else tvlink("doctor", timeout=60)
@@ -291,9 +303,9 @@ def status(brief=False):
     label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
     if s.get("code") and s.get("code") != "000" and s.get("state") in ("waiting", "folder"):
         label += f" (HTTP {s['code']})"
-    return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": schema().get("version"),
+    return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": sch.get("version"),
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
-            "tv": tv or "unknown", "tunnel": tunnel or "unknown", "uptime": uptime(),
+            "tv": tv or "unknown", "method": power_method(sch), "tunnel": tunnel or "unknown", "uptime": uptime(),
             "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
 
 
@@ -971,8 +983,9 @@ class Handler(BaseHTTPRequestHandler):
         shot = (f'<img src="{self.base}/screenshot.jpg?{s["screenshot"]}" alt="What the TV shows">' if s["screenshot"]
                 else '<div class="noshot">No screenshot yet</div>')
         taken = time.strftime("Taken %H:%M:%S", time.localtime(s["screenshot"])) if s["screenshot"] else ""
+        tv = f'{s["tv"].capitalize()} ({METHODS.get(s.get("method"), METHODS["cec"])[0]})'  # eg Unknown (Infrared)
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
-                ("TV", e(s["tv"].capitalize())), ("Tunnel", e(s.get("tunnel", "").capitalize())),
+                ("TV", e(tv)), ("Tunnel", e(s.get("tunnel", "").capitalize())),
                 ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
         body = (f'<div class="grid"><figure>{shot}<figcaption><span>{taken}</span>'
@@ -1031,11 +1044,11 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = self.unit.action(action)
             return self.flash_back(back, msg, not ok)
         flash, bad = self.take_flash()
+        _, on, off = METHODS.get(power_method(self.unit.schema()), METHODS["cec"])
         cards = [("reload", "Reload Page", "Reloads the page on the TV."),
                  ("identify", "Identify", "The unit's name and IP across the TV for up to a minute."),
                  ("screenshot", "Take Screenshot", "What the TV shows now, on the Status page."),
-                 ("on", "TV On", "Wakes the TV over HDMI-CEC and switches it to the Pi."),
-                 ("off", "TV Off", "Puts the TV in standby. The power mode may wake it again.")]
+                 ("on", "TV On", on), ("off", "TV Off", off + " The power mode may wake it again.")]
         csrf = csrf_input(self.sess)
         body = '<div class="actions">' + "".join(
             f'<form method="post" action="{self.base}/actions" class="card">{csrf}<strong>{label}</strong><p>{hint}</p>'
@@ -1303,6 +1316,8 @@ def test():
     assert form_changes(keys, {**form, "WIFI1_PSK": "new-pass-1"})["WIFI1_PSK"] == "new-pass-1"
     assert error_key("WIFI1_PSK is 8 to 63 characters", ["WIFI1_SSID", "WIFI1_PSK"]) == "WIFI1_PSK"
     assert error_key("Unknown setting: FOO=1 (keys: ...)", ["FOO"]) == "FOO" and error_key("Can't write", ["A"]) is None
+    assert power_method({"keys": [{"key": "POWER_METHOD", "value": "ir"}]}) == "ir" and power_method({}) == "cec"
+    assert set(METHODS) == {"cec", "ir", "signal", "none"}  # as tvlink's POWER_METHOD choices
     assert save({"bad key": "1"})[0] is False and save({"A": 1})[0] is False and save({}) == (True, "Nothing changed",
                                                                                                 None)
     with tempfile.TemporaryDirectory() as tmp:

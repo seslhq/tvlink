@@ -13,7 +13,7 @@ python3 tvlink-agent test
 python3 tvlink-console test
 ```
 
-A change to install.sh, the units, CEC, Wi-Fi, the kiosk or the console also needs `tests/vm.sh`
+A change to install.sh, the units, TV power, HDMI, Wi-Fi, the kiosk or the console also needs `tests/vm.sh`
 ([docs/testing.md](docs/testing.md)). It runs on an Apple silicon Mac only: if you can't run it, say so in the pull
 request and the maintainer will.
 

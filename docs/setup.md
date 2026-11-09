@@ -11,7 +11,8 @@
 - Optional: the official rechargeable RTC battery, for `schedule` and `motion` and for sites without reliable
   internet (it keeps the clock across power cuts). Turn on charging for that rechargeable cell only:
   `dtparam=rtc_bbat_vchg=3000000` in `/boot/firmware/config.txt`.
-- Optional: a motion sensor (below). PoE needs a third-party Pi 5 PoE+ HAT that clears the Active Cooler.
+- Optional: a motion sensor, an IR LED and receiver (below). PoE needs a third-party Pi 5 PoE+ HAT that clears the
+  Active Cooler.
 - A spare set (Pi, card, power supply, cable) for every handful of units.
 
 ## Provisioning a unit
@@ -48,7 +49,9 @@ Image every unit fresh; never clone a configured card (clones share SSH host key
 
 tvlink drives the TV with `cec-ctl` over the Pi 5's built-in CEC. Test every TV model before buying more of it:
 `sudo tvlink off`, `sudo tvlink on` (note how long the picture takes), and `tvlink status` answering `on` or
-`standby`. A model that fails runs with `CEC=0` and `POWER_MODE=always` or `manual`, relying on its own settings.
+`standby`. A model that fails can use infrared (below) or the HDMI signal (`POWER_METHOD=signal`, for a TV that sleeps
+without a signal and wakes with one), or `POWER_METHOD=none` with `POWER_MODE=always` or `manual`, relying on its own
+settings ([power methods](configuration.md#power-methods)).
 
 CEC is usually off by default and has a brand name in the TV menu: Samsung Anynet+, LG SimpLink, Sony BRAVIA Sync,
 Panasonic VIERA Link, Philips EasyLink, Toshiba CE-Link or REGZA Link; Hisense and TCL usually HDMI-CEC or T-Link.
@@ -78,3 +81,28 @@ For `POWER_MODE=motion` or `manual+motion` ([power modes](configuration.md#power
   high while anyone is present.
 - A missing gpiozero or a bad pin is logged; an unwired sensor just reads no motion. Either way `motion` keeps its
   on-hours and `manual+motion` acts as `manual`.
+
+## IR transmitter and receiver
+
+For `POWER_METHOD=ir` ([power methods](configuration.md#power-methods)). Turn off the Pi before wiring.
+
+- Transmitter: a 940 nm IR LED, driven by an NPN transistor (eg 2N2222 or BC337), since a GPIO gives too little
+  current. GPIO18 (pin 12) through 1 kΩ to the base; emitter to GND (pin 14); 5 V (pin 4) through 68 Ω to the LED's
+  anode, its cathode to the collector (about 50 mA pulses). Put the LED a few centimetres from the TV's IR window, or
+  on a lead taped beside it, pointing in.
+- Receiver, only to learn codes: a 38 kHz IR receiver module such as a TSOP38238, run from 3.3 V so its output is
+  safe for the Pi: VS to 3.3 V (pin 17), GND to pin 20, OUT to GPIO23 (pin 16).
+- Other pins: `IR_TX_PIN` and `IR_RX_PIN` (BCM numbers); blank `IR_RX_PIN` for no receiver.
+
+Then set it up and reboot (the overlays go in `config.txt`):
+
+```bash
+sudo tvlink set POWER_METHOD=ir IR_CODES=samsung   # or lg, sony, toshiba, or learned
+sudo reboot
+sudo tvlink ir test off; sudo tvlink ir test on      # the TV should follow each
+```
+
+To learn codes instead: `sudo tvlink ir learn on`, press the remote's power on button at the receiver, then the same
+for `off`, then `sudo tvlink set IR_CODES=learned`. Learn discrete power on and power off buttons (a universal or
+hotel remote often has them); a single power toggle can't work, since the Pi can't see which way the TV went. Learned
+codes are in `/var/lib/tvlink/ir/` (root only, on the card's root partition).

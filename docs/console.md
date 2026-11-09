@@ -25,9 +25,9 @@ and prints a new code. API tokens keep working.
 
 | Page | Shows or does |
 | --- | --- |
-| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power, the tunnel (off, connected or not connected), name, IP, version, uptime, and `tvlink doctor`'s health lines |
-| Settings | Every setting `tvlink set` takes, as a form built from `tvlink keys --json`; values are checked by `tvlink set` and errors show beside the field |
-| Actions | Reload Page, Identify, Take Screenshot, TV On, TV Off, and Reboot (asks first, on the page) |
+| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power and the power method, the tunnel (off, connected or not connected), name, IP, version, uptime, and `tvlink doctor`'s health lines |
+| Settings | Every setting `tvlink set` takes, as a form built from `tvlink keys --json`; values are checked by `tvlink set` and errors show beside the field; a change to the boot files says to reboot |
+| Actions | Reload Page, Identify, Take Screenshot, TV On and TV Off (by the power method, which the page names), and Reboot (asks first, on the page) |
 | Logs | The last 200 lines of the kiosk, TV power and Wi-Fi network logs |
 | Wi-Fi | The `WIFI*` settings and the networks the unit can see |
 | Update | `tvlink update` with an archive URL and its SHA-256 ([operations](operations.md#updates)) |

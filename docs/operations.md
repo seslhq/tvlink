@@ -15,8 +15,9 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 | Command | Does |
 | --- | --- |
 | `tvlink show`, `sudo tvlink set KEY=value` | Read and change settings ([configuration](configuration.md)) |
-| `sudo tvlink on`, `sudo tvlink off`, `tvlink status` | TV power over CEC, and what the TV reports |
-| `sudo tvlink doctor` | Health on one screen: page, services, clock, power and heat, memory, disk, HDMI, CEC, Wi-Fi |
+| `sudo tvlink on`, `sudo tvlink off`, `tvlink status` | TV power by `POWER_METHOD`, and what is known of the TV: CEC's answer, the signal last sent, or `unknown` (IR) |
+| `sudo tvlink ir learn on\|off`, `sudo tvlink ir test on\|off` | Record a power code from the TV's remote; send one once ([IR](setup.md#ir-transmitter-and-receiver)) |
+| `sudo tvlink doctor` | Health on one screen: page, services, clock, power and heat, memory, disk, HDMI, CEC or IR, Wi-Fi |
 | `sudo tvlink screenshot` | Saves what the TV shows to `/run/tvlink/screen.jpg` |
 | `sudo tvlink identify` | Puts the unit's name and IP across the screen for up to 60 s |
 | `sudo tvlink reload` | Reloads the page |
@@ -50,7 +51,7 @@ Debian and Raspberry Pi security updates install at 02:30 (every night on canary
 the rest) and the 03:30 reboot loads them. Hold a bad package everywhere with `sudo apt-mark hold <package>`.
 
 To update tvlink itself, copy the new folder and rerun the installer, which restarts the services (reboot only if it
-says `cmdline.txt` changed):
+says `Reboot to apply`):
 
 ```bash
 scp -r tvlink <user>@tv-lobby-01.local:
@@ -78,7 +79,13 @@ halfway: `journalctl -u tvlink-update -f`.
 - Badge changes and page recoveries are in the same log: `journalctl -t tvlink -b | grep 'Badge\|Recover'`.
 - `Tunnel: not connected` in `tvlink doctor`: `journalctl -u tvlink-tunnel -b` ([Cloudflare](cloudflare.md)).
 - `journalctl -u tvlink-power -b`: power mode, clock, wakes and standbys, `TV reports ...`, motion sensor problems.
-- `tvlink status` says `unknown`: CEC is off in the TV menu, or the TV does not answer power queries.
+- `tvlink status` says `unknown`: CEC is off in the TV menu, or the TV does not answer power queries. With
+  `POWER_METHOD=ir` it always does: IR is one-way.
+- IR does nothing: `sudo tvlink doctor` should name a transmitter on its `TV power` line (else the overlay is not
+  loaded: reboot after setting `POWER_METHOD=ir`, check the wiring); point the LED at the TV's IR window; try the other
+  brand codes or learn them. A phone camera shows the LED flash during `sudo tvlink ir test on`.
+- Signal off but the TV stays on: the TV has no no-signal standby, or it is set long; use CEC or IR. The kiosk log
+  shows `HDMI signal off (HDMI-A-1)` when it acts.
 - A server page such as 404 on the TV: the page answered, so tvlink shows its answer, with `Board not found` on the
   badge.
 - Black screen: the HDMI cable in HDMI0, the TV input, and `systemctl status tvlink`.

@@ -11,7 +11,8 @@ handled and no site visits. The page is the content; tvlink keeps it on screen.
 - Remote first: change, restart, check and see the screen without visiting.
 
 Out of scope: playlists and per-item scheduling, video walls, touch or interactive kiosks, anything drawn inside the
-page itself (eg pixel shift or a night theme), captive portals and WPA-Enterprise, and TVs without working CEC.
+page itself (eg pixel shift or a night theme), captive portals and WPA-Enterprise, and TVs that answer neither CEC,
+infrared discrete codes nor the HDMI signal.
 
 ## Parts
 
@@ -21,12 +22,13 @@ page itself (eg pixel shift or a night theme), captive portals and WPA-Enterpris
 | status loop (in `tvlink kiosk`) | kiosk | Probes the page (HTTP below 500 counts as up), scans the local folder, and writes `/run/tvlink/status.js` |
 | `splash.html` | Chromium | Shows what the loop reports, plays local content, and hands over to the page once it answers |
 | `tvlink-agent` | kiosk | Runs Chromium over a DevTools pipe: draws the badge, recovers crashed, frozen or error pages, takes requests (screenshot, identify, reload) |
-| `tvlink-power` | root | The only user of CEC and the motion sensor: power modes, clock trust, power-cut handling |
+| `tvlink-power` | root | The only process that turns the TV on and off by itself (CEC, IR or the HDMI signal), and the only user of the motion sensor: power modes, clock trust, power-cut handling |
 | `tvlink net` | root | Turns the Wi-Fi keys into NetworkManager profiles held in RAM |
 | `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
 | `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
 | `tvlink check` | root | Gate for the nightly reboot timer |
+| `tvlink boot` | root | Writes `cmdline.txt` and `config.txt` from the settings; run by install.sh and `tvlink set` |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
 
 One prober feeds everyone: the splash reads `status.js` as JSONP from `file://`, and the agent reads the same file for
@@ -54,8 +56,26 @@ badge state in over the DevTools pipe instead.
 - **Clock trust.** On-hours run only once NTP has synced this boot or the RTC holds a sane date; until then the TV
   stays on. Motion timing uses the monotonic clock. On-hours compare instants, not wall time, so a `TV_ON` or
   `TV_OFF` in the hour repeated when clocks go back acts once.
-- **TV power.** CEC only, through `cec-ctl`, by one process. A TV that drops hotplug in standby is woken from the
-  unregistered address, the only message the kernel still lets through.
+- **TV power.** One process decides (`tvlink-power`), and `tvlink on|off|status` carries it out by `POWER_METHOD`, so
+  every power mode works with every method. CEC through `cec-ctl`: a TV that drops hotplug in standby is woken from
+  the unregistered address, the only message the kernel still lets through. The modes need only one thing from a
+  method: whether `status` can be believed. `unknown` (IR, or a TV that never answered) means no re-wake checks, so a
+  one-way method never loops; `standby` or `off` means wake again in on-time.
+- **Infrared: discrete codes only, sourced or learned.** A toggle code can't be used without knowing the TV's state,
+  which IR can't give, so the built-in table holds only discrete on and off codes with a cited source (IRDB, Tasmota's
+  code list), and anything else is learned from the TV's own remote as raw pulses, which works for any protocol.
+  `ir-ctl` from v4l-utils (already installed) sends through the kernel's `gpio-ir-tx` and records through `gpio-ir`,
+  both `config.txt` overlays; the receiver maps no keys, so a remote can't type into the kiosk. Samsung's 32-bit
+  protocol has no kernel encoder, so tvlink writes its pulses; the kernel's decoder reads them back as the same code.
+- **Signal off through the kiosk.** tvlink-power is root and stays out of the kiosk's Wayland session: `tvlink on|off`
+  writes the wanted signal to `/run/tvlink-display` (root's, readable by all) and asks the agent through the request
+  file; the agent runs `tvlink mode` as the kiosk, which turns cage's outputs off or on with `wlr-randr`. It runs every
+  30 s and after every kiosk start too, so the signal stays as asked across browser restarts. cage keeps running with
+  no output on; Chromium does too, but makes no page without one, so the kiosk starts with the output on and the
+  agent turns it off once the page is up. The agent skips the frozen-page check while the signal is off.
+- **Boot files from the settings.** `tvlink boot` owns tvlink's arguments on `cmdline.txt` (mode, quiet boot) and a
+  marked block at the end of `config.txt` (IR overlays), leaves the rest alone, and writes only on a change, beside
+  then renamed.
 - **Nightly reboot as the backstop.** At 03:30, never in the first hour after boot, never while an upgrade runs, and
   skipped for up to a week while a configured page is down, so an outage keeps the last good screen.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the
@@ -112,7 +132,9 @@ badge state in over the DevTools pipe instead.
 | --- | --- |
 | Raspberry Pi OS Lite is Trixie: Python 3.13, NetworkManager, Chromium as `chromium`, cage 0.3 in the Raspberry Pi repo | Trixie only |
 | cage takes the TV's preferred mode and ignores `video=`, but supports `wlr-randr` | Mode set inside cage |
-| cage has no output power protocol | TV power over CEC, not by blanking the signal |
+| cage has no output power protocol, but `wlr-randr` can turn its only output off and on, and it keeps running | `POWER_METHOD=signal`; CEC by default |
+| Chromium makes no page while no output is on | The kiosk starts with the signal on, then turns it off |
+| `ir-ctl` encodes NEC, RC5, RC6, Sony, JVC, Sanyo, Sharp, iMON and RC-MM, not Samsung32 or Kaseikyo (Panasonic) | Samsung pulses built by tvlink; Panasonic learned |
 | Chromium's debugging port has no authentication | Pipe instead of a port |
 | The Pi 5 has no hardware H.264 decoder and Chromium has no HEVC path there | Local video is H.264 1080p30 |
 | Each HDMI port has a CEC adapter; with hotplug down only Image View On from Unregistered gets through | Unregistered wake |

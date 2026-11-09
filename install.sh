@@ -67,24 +67,10 @@ printf '[connection]\nwifi.powersave = 2\n' >/etc/NetworkManager/conf.d/default-
 printf '{"URLBlocklist": ["devtools://*", "view-source:*", "chrome://*"], "AllowFileSelectionDialogs": false,
  "DownloadRestrictions": 3}\n' >/etc/chromium/policies/managed/tvlink.json
 
-# Kernel command line: HDMI mode, no console blanking, and no boot text or cursor, so the TV goes from black to the
-# splash. Boot logs stay in journalctl. Keep the original once.
-RESOLUTION=$(sed -n 's/^RESOLUTION=//p' <<<"$settings")
-[ -e "$BOOT/cmdline.txt.orig" ] || cp "$BOOT/cmdline.txt" "$BOOT/cmdline.txt.orig"
-ours='^(video=HDMI-A-[0-9]+:.*|consoleblank=.*|quiet|loglevel=.*|logo\.nologo|vt\.global_cursor_default=.*)$'
-cmd=$(tr ' ' '\n' <"$BOOT/cmdline.txt" | grep -vE "$ours" | paste -sd' ' -)
-cmd+=" consoleblank=0 quiet loglevel=3 logo.nologo vt.global_cursor_default=0"
-[ "$RESOLUTION" = auto ] || cmd+=" video=HDMI-A-1:$RESOLUTION video=HDMI-A-2:$RESOLUTION"
-# Only when it changes, and beside then rename: a cut mid-write must never leave a cmdline.txt the Pi can't boot.
-if [ "$cmd" != "$(cat "$BOOT/cmdline.txt")" ]; then
-  echo "$cmd" >"$BOOT/cmdline.txt.tmp"
-  sync "$BOOT/cmdline.txt.tmp"
-  mv -f "$BOOT/cmdline.txt.tmp" "$BOOT/cmdline.txt"
-  sync -f "$BOOT/cmdline.txt"
-  echo "cmdline.txt changed: reboot to apply it"
-fi
 # No rainbow screen from the firmware.
 grep -q '^disable_splash=1' "$BOOT/config.txt" || printf '\n[all]\ndisable_splash=1\n' >>"$BOOT/config.txt"
+# cmdline.txt (HDMI mode, a quiet boot) and config.txt (IR overlays) from the settings: tvlink boot.
+TVLINK_CONF="$CONF" ./tvlink boot
 
 # Raspberry Pi Connect (preinstalled on Lite) runs as the admin user's service: keep it up without a login.
 [ -z "${SUDO_USER:-}" ] || loginctl enable-linger "$SUDO_USER"

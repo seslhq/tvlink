@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
-"""TV power over HDMI-CEC: always on, on-hours, plus motion wake, manual, or manual plus motion wake.
+"""TV power: always on, on-hours, plus motion wake, manual, or manual plus motion wake, by any POWER_METHOD.
 Usage: tvlink-power [test]
 
 POWER_MODE in tvlink.conf:
@@ -18,6 +18,10 @@ again if it reports standby, or if it answered before and has gone silent (some 
 on-time any standby is undone, even one from the remote. A TV that never answers is only woken when on-time starts.
 Standby is sent when on-time ends and at any start in off-hours; after a power cut it is re-sent for 10 min while the
 TV may still be coming on. Until the clock can be trusted (NTP synced, or the RTC holds a sane date) the TV stays on.
+
+POWER_METHOD: how `tvlink on|off` reaches the TV. cec answers status queries. ir never does (status unknown), so it is
+handled as a TV that never answers: codes at the boundaries and after a power cut, never a re-wake loop. signal
+reports what was last sent (on or off; off counts as standby). none: this exits.
 """
 import glob
 import os
@@ -125,6 +129,16 @@ def after_power_cut():
     return not planned
 
 
+def follow_up(action, seen, answered):
+    """After a check or settle, what to send given what the TV reports: on, standby (or off: signal), unknown."""
+    asleep = seen in ("standby", "off")
+    if action == "settle":
+        return None if asleep else "off"
+    if action == "check" and (asleep or (seen == "unknown" and answered)):
+        return "on"  # standby, or silent after answering before: it dropped hotplug in standby
+    return None
+
+
 def tv(action):
     """tvlink on|off|status. Returns its output (status: on, standby or unknown); on and off output also goes to the
     journal. A hung cec-ctl raises after 60 s and systemd restarts the service."""
@@ -136,8 +150,9 @@ def tv(action):
 
 def main():
     conf = read_conf()
-    if conf.get("CEC", "1") != "1":
-        print("CEC=0: not controlling the TV", flush=True)
+    method = conf.get("POWER_METHOD", "cec")
+    if method == "none":
+        print("POWER_METHOD=none: not controlling the TV", flush=True)
         return
     mode, on, off, idle, pin = settings(conf)
     power_cut = after_power_cut()
@@ -148,12 +163,13 @@ def main():
             pir = MotionSensor(pin)
         except Exception as e:  # no sensor, no gpiozero, wrong pin: still keep on-hours (or manual)
             print(f"Motion sensor on GPIO{pin} unavailable ({e}): no motion wake", flush=True)
-    for _ in range(30):  # /dev/cec* can appear after boot starts this
+    for _ in range(30 if method == "cec" else 0):  # /dev/cec* can appear after boot starts this
         if glob.glob("/dev/cec*"):
             break
         time.sleep(1)
     if mode.startswith("manual"):
-        print(f"POWER_MODE={mode}: " + ("power cut, waking the TV" if power_cut else "leaving the TV alone"),
+        print(f"POWER_MODE={mode} by {method}: "
+              + ("power cut, waking the TV" if power_cut else "leaving the TV alone"),
               flush=True)
         woke = False
         for _ in range(20 if power_cut else 0):  # the TV may still be starting up after the same cut
@@ -172,7 +188,7 @@ def main():
                 tv("on")
             time.sleep(1)
         return
-    print(f"POWER_MODE={mode}" + ("" if mode == "always" else f" {on:%H:%M}-{off:%H:%M}")
+    print(f"POWER_MODE={mode} by {method}" + ("" if mode == "always" else f" {on:%H:%M}-{off:%H:%M}")
           + (f", idle {idle // 60} min" if mode == "motion" else ""), flush=True)
     trusted = clock_ok()
     if not trusted:
@@ -197,10 +213,8 @@ def main():
             if seen != state:
                 state = seen
                 print(f"TV reports {state}", flush=True)
-            if action == "settle" and seen != "standby":
-                tv("off")
-            elif action == "check" and (seen == "standby" or (seen == "unknown" and answered)):
-                tv("on")  # standby, or silent after answering before: it dropped hotplug in standby
+            if send := follow_up(action, seen, answered):
+                tv(send)
         elif action:
             tv(action)
         if action in ("on", "check"):
@@ -248,6 +262,44 @@ def test():
     # after a cut in off-hours: re-check every 30 s for 10 min, nothing once the window ends
     assert step(False, False, True, True) == "settle" and step(False, False, False, True) is None
     assert step(False, False, True, False) is None and step(True, True, True, True) == "check"
+    assert follow_up("check", "standby", False) == "on" and follow_up("check", "off", False) == "on"  # signal: off
+    assert follow_up("check", "unknown", True) == "on" and follow_up("check", "unknown", False) is None  # IR: never
+    assert follow_up("check", "on", True) is None and follow_up("settle", "unknown", False) == "off"
+    assert follow_up("settle", "standby", True) is None and follow_up("settle", "off", True) is None
+    # Each method through a day from a power cut at 03:00, as main() runs it, the TV back on by itself after the cut,
+    # and turned off at 12:00 (the remote; the console for signal). What each reports: CEC the truth, IR nothing,
+    # signal the last send.
+    for mode in ("always", "schedule", "motion"):
+        for method in ("cec", "ir", "signal"):
+            power, sent, prev, next_check, answered = "on", [], None, 0, False
+            for t in range(0, 24 * 3600, 30):
+                now = d(3) + timedelta(seconds=t)
+                if now == d(12):
+                    power = "off"
+                want = want_on(mode, now, six, ten, None, 900)
+                prev = not want if prev is None else prev
+                action = send = step(want, prev, t >= next_check, t < 600)
+                if action in ("check", "settle"):
+                    seen = {"cec": "standby" if power == "off" else "on", "ir": "unknown", "signal": power}[method]
+                    answered = answered or seen == "on"
+                    send = follow_up(action, seen, answered)
+                if send:
+                    sent.append((now.hour, send))
+                    power = send
+                if action in ("on", "check"):
+                    next_check = t + POLL
+                elif action in ("off", "settle"):
+                    next_check = t + 30
+                prev = want
+            ons = [h for h, a in sent if a == "on"]
+            offs = [h for h, a in sent if a == "off" and h != 3]
+            assert offs == ([] if mode == "always" else [22]), (mode, method, sent)
+            if method == "ir":  # one on when on-time starts, never again; standby re-sent for 10 min after the cut
+                assert ons == [3 if mode == "always" else 6], (mode, sent)
+                assert sent.count((3, "off")) == (0 if mode == "always" else 20), (mode, sent)
+            else:  # one standby after the cut, which the TV reports; the 12:00 standby undone at the next check
+                assert ons == ([3, 12] if mode == "always" else [6, 12]), (mode, method, sent)
+                assert sent.count((3, "off")) == (0 if mode == "always" else 1), (mode, method, sent)
     assert settings({"POWER_MODE": "motion", "TV_ON": "06:00"})[0] == "always"
     assert settings({"POWER_MODE": "schedule", "TV_ON": "06:00", "TV_OFF": "06:00"})[0] == "always"
     assert settings({"POWER_MODE": "bogus"})[0] == "always"
@@ -297,11 +349,17 @@ def test():
         got = read_conf(cli, cwd=tmp, env=dict(os.environ, TVLINK_CONF=conf))
         assert got.pop("VERSION")
         want = {"BOARD_URL": "https://board.example.com/d/abc?v=#top", "SOURCE": "folder", "FIT": "cover",
-                "TV_ON": "06:30", "TV_OFF": "22:00", "CEC": "1", "POWER_MODE": 'mo"tion', "SLIDE_SECONDS": "10",
-                "IDLE_MIN": "5", "MOTION_PIN": "17", "RESOLUTION": "1920x1080@60", "OVERLAY_CORNER": "top-left",
-                "WIFI1_SSID": "Caf\ufffd"}
+                "TV_ON": "06:30", "TV_OFF": "22:00", "POWER_METHOD": "cec", "POWER_MODE": 'mo"tion',
+                "SLIDE_SECONDS": "10", "IDLE_MIN": "5", "MOTION_PIN": "17", "RESOLUTION": "1920x1080@60",
+                "OVERLAY_CORNER": "top-left", "WIFI1_SSID": "Caf\ufffd"}
         assert {k: got.get(k) for k in want} == want, got
         assert not os.path.exists(os.path.join(tmp, "pwned"))
+        # The old CEC=0 still means none, unless POWER_METHOD says otherwise; a bad method falls back.
+        for text, method in (("CEC=0", "none"), ("CEC=0\nPOWER_METHOD=ir", "ir"), ("POWER_METHOD=infrared", "cec"),
+                             ("CEC=0\nPOWER_METHOD=infrared", "none"), ("POWER_METHOD=signal", "signal")):
+            with open(conf, "w") as f:
+                f.write(text + "\n")
+            assert read_conf(cli, env=dict(os.environ, TVLINK_CONF=conf))["POWER_METHOD"] == method, text
     print("ok")
 
 
