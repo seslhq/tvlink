@@ -17,3 +17,4 @@ jobs:
       - run: python3 tvlink-power test
       - run: python3 tvlink-agent test
       - run: python3 tvlink-console test
+      - run: python3 tvlink-content test

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink last good screen, hourly
+
+[Timer]
+OnCalendar=hourly
+
+[Install]
+WantedBy=timers.target

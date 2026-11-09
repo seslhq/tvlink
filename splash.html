@@ -1,5 +1,6 @@
 <!doctype html>
 <!-- Start page: logo and setup state, or a slideshow of local content, until the board answers; then hands over.
+     With no network or board and no local content, the last good screen (LAST_GOOD=1), marked Offline.
      Status from /run/tvlink/status.js.
      SPDX-License-Identifier: Apache-2.0
      Copyright 2026 cpwillis (https://github.com/seslhq/tvlink) -->
@@ -29,6 +30,12 @@
   #show[hidden] { display: block; visibility: hidden; } /* a page in the frame still loads at full size */
   #show > * { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity .6s; }
   #show > .on { opacity: 1; }
+  #last { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  /* The agent's badge, red: what is on screen is not live. */
+  #mark { position: fixed; display: flex; align-items: center; gap: .5em; padding: .35em .7em; border-radius: 1em;
+    font: 600 max(14px, .85vw)/1.2 system-ui, "DejaVu Sans", sans-serif; color: var(--ink); background: var(--bad); }
+  #mark i { width: .7em; height: .7em; border-radius: 50%; background: var(--ink); }
+  #mark[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -51,6 +58,8 @@
 </main>
 <footer id="foot"><span id="device"></span><span id="clock"></span><span>github.com/seslhq/tvlink</span></footer>
 <div id="show" hidden></div>
+<img id="last" hidden alt="">
+<div id="mark" hidden><i></i><span id="mark-text"></span></div>
 <script>
   const $ = id => document.getElementById(id);
   // ?status= points at another file for previews off the Pi.
@@ -146,6 +155,24 @@
     if (kind === "iframe") $("show").append(el); // a frame only loads once it is in the page
   }
 
+  // The last good screen full screen, with when it was taken in the badge's corner; false if there is none.
+  let lastBad = false;
+  function lastGood(s) {
+    const show = !lastBad && s.last > 0 && (s.state === "network" || s.state === "waiting");
+    $("last").hidden = $("mark").hidden = !show;
+    if (!show) return false;
+    if (!$("last").getAttribute("src")) {
+      $("last").onerror = () => { lastBad = true; lastGood(s); render(s); };
+      $("last").src = "file:///var/lib/tvlink/last.jpg";
+    }
+    const when = new Date(s.last * 1000).toLocaleString([], {day: "numeric", month: "short", hour: "2-digit",
+      minute: "2-digit", hourCycle: "h23"});
+    $("mark-text").textContent = `Offline, from ${when}`;
+    const [v, h] = /^(top|bottom)-(left|right)$/.test(s.corner) ? s.corner.split("-") : ["bottom", "right"];
+    $("mark").style.cssText = `${v}: 24px; ${h}: 24px;`;
+    return true;
+  }
+
   // Called by status.js. A slow board must not be restarted by the next poll: hand over at most every 30 s.
   let away = 0;
   window.tvlink = s => {
@@ -153,10 +180,10 @@
       if (Date.now() - away > 30000) { away = Date.now(); location.replace(s.url); }
       return;
     }
-    if (s.state === "folder" && s.files?.length) return folder(s);
+    if (s.state === "folder" && s.files?.length) { lastGood({}); return folder(s); }
     stop();
     broken = "";
-    render(s);
+    if (!lastGood(s)) render(s);
   };
 
   function poll() {

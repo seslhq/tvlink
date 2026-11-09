@@ -16,7 +16,13 @@ After start and every 30 s it runs `tvlink mode`, which sets the HDMI mode again
 requests from the tvlink CLI in /run/tvlink/request: identify (name and IP big on screen for up to 60 s, or until the
 page reloads; also the console's claim code while it has one), screenshot (JPEG to /run/tvlink/screen.jpg), reload,
 and display on|off (run `tvlink mode` now). While the signal is off it skips the health check: a dark screen is not a
-fault. It sends no CEC and needs no root.
+fault. It sends no CEC and needs no root. Also:
+- a new BOARD_URL (status.js says it answers, and the page shown came from another) loads in a background tab and swaps
+  in once it has loaded, so the screen goes from page to page with no splash; if it fails, the old page stays;
+- LAST_GOOD=1: a screenshot of the live page, badge hidden, every 10 min to /run/tvlink/last.jpg, which root keeps
+  hourly (tvlink lastgood) for the splash at a start with no network;
+- BROWSER_RESTART=HH:MM: Chromium restarts then (cage and the agent stay), not in the first hour after boot, and
+  while the signal is off only once it is back on.
 """
 import base64
 import fcntl
@@ -28,17 +34,21 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, time as dtime, timedelta
 
 CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
 STATUS = os.environ.get("TVLINK_STATUS", "/run/tvlink/status.js")
 SPLASH = os.environ.get("TVLINK_SPLASH", "file:///usr/share/tvlink/splash.html")
 REQUEST = os.path.join(os.path.dirname(STATUS), "request")  # one word from `tvlink identify|screenshot|reload`
 SCREEN = os.path.join(os.path.dirname(STATUS), "screen.jpg")
+LAST = os.path.join(os.path.dirname(STATUS), "last.jpg")  # LAST_GOOD=1: the live page, root keeps it hourly
+UPTIME = os.environ.get("TVLINK_UPTIME", "/proc/uptime")  # as tvlink check reads it (the VM test stands one in)
 SIGNAL = os.environ.get("TVLINK_SIGNAL", "/run/tvlink-display")  # root's: off while POWER_METHOD=signal has it off
 SYNCED = os.environ.get("TVLINK_SYNCED", "/run/systemd/timesync/synchronized")  # timesyncd: NTP synced this boot
 RTC = "/sys/class/rtc/rtc0/since_epoch"
 CLOCK_FLOOR = 1793491200  # 2026-11-01, as in tvlink-power
 TICK, PUSH, HEALTH, MODE = 1, 15, 30, 30  # seconds: event poll, badge refresh, page health check, HDMI mode check
+SHOT_EVERY, SETTLE = 600, 30  # LAST_GOOD: seconds between screenshots, and of a new page live before the first
 
 # Runs in every document before the page's own scripts; the agent fills it in with __tvlinkOverlay(state).
 OVERLAY = r"""(() => {
@@ -165,6 +175,37 @@ def badge(status, last_ok, net, page_status, clock):
     return "live", f"{net} {shown}".strip()
 
 
+def uptime(path=UPTIME):
+    try:
+        with open(path) as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def restart_due(at, now, up, dark):
+    """BROWSER_RESTART at epoch at: restart, skip (in the first hour after boot) or None (not yet, or dark: Chromium
+    would make no page; it waits for the signal)."""
+    if at is None or now < at or dark:
+        return None
+    return "restart" if up >= 3600 else "skip"
+
+
+def next_restart(at, now):
+    """Epoch of the first daily BROWSER_RESTART (HH:MM local) after now, or None if blank. Instants, not wall time,
+    as in tvlink-power: a time in the hour repeated when clocks go back runs once, one in a skipped hour an hour
+    late."""
+    if not at:
+        return None
+    t, day = dtime(*map(int, at.split(":"))), datetime.fromtimestamp(now).date()
+    while (when := datetime.combine(day, t).timestamp()) <= now:
+        day += timedelta(1)
+    return when
+
+
+LOADED = "[document.readyState, location.href, performance.getEntriesByType('navigation')[0]?.responseStatus || 0]"
+
+
 class Browser:
     """Chromium on --remote-debugging-pipe: commands on its fd 3, answers and events on its fd 4, NUL-separated."""
 
@@ -193,6 +234,7 @@ class Browser:
                 answer = self.waiting.pop(msg["id"], None) if "id" in msg else None
                 (answer or self.events).put(msg)
         self.events.put(None)  # the browser has gone
+        os.close(self.resp_r)
 
     def send(self, method, params=None, session=None, timeout=10):
         with self.lock:
@@ -209,7 +251,7 @@ class Browser:
         return msg.get("result", {})
 
     def attach(self):
-        """Session on the page; the overlay goes into every document it loads from now on."""
+        """(session, target id) of the page; the overlay goes into every document it loads from now on."""
         for _ in range(60):
             pages = [t for t in self.send("Target.getTargets", timeout=30)["targetInfos"] if t["type"] == "page"]
             if pages:
@@ -217,21 +259,63 @@ class Browser:
             time.sleep(0.5)
         else:
             raise RuntimeError("no page target")
-        session = self.send("Target.attachToTarget", {"targetId": pages[0]["targetId"], "flatten": True})["sessionId"]
+        return self.setup(pages[0]["targetId"]), pages[0]["targetId"]
+
+    def setup(self, target):
+        session = self.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
         for method in ("Page.enable", "Inspector.enable"):  # no Runtime.enable: its console events are not needed
             self.send(method, session=session)
         self.send("Page.addScriptToEvaluateOnNewDocument", {"source": OVERLAY}, session)
         self.send("Runtime.evaluate", {"expression": OVERLAY}, session)
         return session
 
+    def load(self, url, timeout=30):
+        """(session, target id) of url, loaded in a new background tab; RuntimeError (the tab closed) if it fails to
+        load, answers 400 or more, or takes longer than timeout seconds."""
+        target = self.send("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
+        try:
+            session = self.setup(target)
+            if err := self.send("Page.navigate", {"url": url}, session).get("errorText"):
+                raise RuntimeError(err)
+            end = time.monotonic() + timeout
+            while True:
+                time.sleep(0.5)
+                if time.monotonic() > end:
+                    raise RuntimeError(f"not loaded in {timeout} s")
+                try:
+                    ready, href, code = self.send("Runtime.evaluate", {"returnByValue": True, "expression": LOADED},
+                                                  session)["result"]["value"]
+                except (RuntimeError, KeyError, TypeError, ValueError):
+                    continue  # mid-navigation
+                if ready == "complete" and href != "about:blank":
+                    break
+            if str(href).startswith("chrome-error:") or (type(code) is int and code >= 400):
+                raise RuntimeError(f"HTTP {code}" if code else "error page")
+            time.sleep(1)  # a moment to draw, so the swap shows a whole page
+            return session, target
+        except BaseException:
+            try:
+                self.send("Target.closeTarget", {"targetId": target})
+            except (queue.Empty, RuntimeError):
+                pass
+            raise
+
 
 def main(argv):
     conf = settings()
+    while (rc := run(argv, conf)) == "restart":  # BROWSER_RESTART: a new Chromium, same agent and cage
+        pass
+    return rc
+
+
+def run(argv, conf):
     corner = conf.get("OVERLAY_CORNER") or "bottom-right"
+    keep, restart_at = conf.get("LAST_GOOD") == "1", next_restart(conf.get("BROWSER_RESTART"), time.time())
     browser = Browser(argv)
-    session = browser.attach()
+    session, target = browser.attach()
     last_ok, recoveries, next_push, next_health, shown = None, [], 0.0, time.monotonic() + HEALTH, None
     hung, misses, href, page_status, next_mode = False, 0, "", 0, 0.0  # mode now: the signal off, if it is
+    board, wanted, next_switch, switch_err, live_at, next_shot = None, None, 0.0, None, 0.0, 0.0  # BOARD_URL shown
     while True:
         crashed = False
         try:
@@ -242,9 +326,15 @@ def main(argv):
                     return 1
                 method, params = event.get("method"), event.get("params", {})
                 frame = params.get("frame", {})
-                if method == "Page.frameNavigated" and "parentId" not in frame:  # new page: check it, then badge it
+                if event.get("sessionId", session) != session:  # a tab loading in the background
+                    pass
+                elif method == "Page.frameNavigated" and "parentId" not in frame:  # new page: check it, badge it
                     next_push, next_health, href, page_status = 0.0, 0.0, frame.get("url", ""), 0
-                crashed = crashed or method == "Inspector.targetCrashed"
+                    live_at = time.monotonic()
+                    if not href.startswith("file:"):  # the splash handed over: to the link it was given
+                        board = read_status()[0].get("url")
+                else:
+                    crashed = crashed or method == "Inspector.targetCrashed"
                 event = browser.events.get_nowait()
         except queue.Empty:
             pass
@@ -275,6 +365,29 @@ def main(argv):
             last_ok = time.strftime("%H:%M", time.localtime(written))
         if dark():  # the outputs are off on purpose: a page that does not answer then is no fault
             next_health, misses = now + HEALTH, 0
+        want = status.get("url")
+        if want != wanted:
+            if wanted and board and want == board:  # set back to the page on screen before it was swapped
+                print("Page switch: back to the page on screen", flush=True)
+            wanted, switch_err, next_switch = want, None, 0.0
+        if (board and want and want != board and status.get("state") == "ready" and now >= next_switch
+                and href.startswith("http") and not dark()):  # a new BOARD_URL that answers: swap it in
+            try:
+                new, new_target = browser.load(want)
+                browser.send("Target.activateTarget", {"targetId": new_target})
+                try:
+                    browser.send("Target.closeTarget", {"targetId": target})
+                except (queue.Empty, RuntimeError):
+                    pass
+                session, target, board, switch_err = new, new_target, want, None
+                print("Page switch: the new page is showing", flush=True)  # never the link: it carries its key
+                now = time.monotonic()
+                next_push, next_health, href, page_status, live_at = 0.0, now + HEALTH, want, 0, now
+            except (queue.Empty, RuntimeError, KeyError, TypeError, ValueError) as e:
+                next_switch = time.monotonic() + 60  # then try again
+                if str(e) != switch_err:  # once, not every minute it retries
+                    print(f"Page switch failed ({e}): keeping the old page", flush=True)
+                switch_err = str(e)
         if not crashed and now >= next_health:
             next_health = now + HEALTH
             try:
@@ -316,12 +429,38 @@ def main(argv):
                                                   "returnByValue": True}, session)
             except (queue.Empty, RuntimeError):
                 pass
+        if (keep and now >= next_shot and now - live_at >= SETTLE and href.startswith("http") and page_status < 400
+                and not hung and not dark() and badge(status, last_ok, "", page_status, clock_ok())[0] == "live"):
+            next_shot, next_push = now + SHOT_EVERY, 0.0  # the badge back right after
+            hide = json.dumps({"level": "live", "text": "", "corner": "off"})
+            try:  # without the badge: the splash marks it Offline
+                browser.send("Runtime.evaluate", {"expression": f"window.__tvlinkOverlay?.({hide})",
+                                                  "returnByValue": True}, session)
+                shot = browser.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80}, session)
+                with open(LAST + ".tmp", "wb") as f:
+                    f.write(base64.b64decode(shot["data"]))
+                os.replace(LAST + ".tmp", LAST)
+            except (queue.Empty, RuntimeError, OSError, KeyError, ValueError) as e:
+                print(f"Last good screenshot failed: {e}", flush=True)
         if now >= next_mode:
             next_mode = now + MODE
             try:
                 subprocess.run([CLI, "mode"], timeout=20, check=False)
             except subprocess.TimeoutExpired:
                 print("tvlink mode did not finish", flush=True)
+        if go := restart_due(restart_at, time.time(), uptime(), dark()):
+            if go == "restart":
+                print("Daily browser restart", flush=True)
+                browser.proc.terminate()
+                try:
+                    browser.proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    browser.proc.kill()
+                    browser.proc.wait()
+                os.close(browser.cmd_w)
+                return "restart"
+            print("Daily browser restart skipped: under an hour since boot", flush=True)
+            restart_at = next_restart(conf.get("BROWSER_RESTART"), time.time())
 
 
 def test():
@@ -337,7 +476,29 @@ def test():
     assert badge({"state": "folder", "code": "503"}, "10:30", "Wired", 200, True) == ("warn", "Cached 10:30")
     assert badge({"state": "network"}, "10:30", "", 404, True)[0] == "bad"  # Offline beats Board not found
     assert badge(live, "10:42", "Wired", 200, False) == ("warn", "Clock not set")
+    # Daily restart: the next HH:MM after now; once on the day clocks go back (Sydney, 03:00 back to 02:00 on 5 Apr),
+    # an hour late on the day they go forward (02:00 on to 03:00 on 4 Oct), never twice in a day.
+    os.environ["TZ"] = "Australia/Sydney"
+    time.tzset()
+    at = lambda *a: datetime(*a).timestamp()
+    assert next_restart("", at(2026, 1, 1)) is None
+    assert next_restart("04:00", at(2026, 1, 1, 3, 59)) == at(2026, 1, 1, 4)
+    assert next_restart("04:00", at(2026, 1, 1, 4)) == at(2026, 1, 2, 4)
+    assert next_restart("00:00", at(2026, 12, 31, 23, 59)) == at(2027, 1, 1)
+    assert restart_due(None, 9e9, 9e9, False) is None and restart_due(100, 99, 9e9, False) is None
+    assert restart_due(100, 100, 3600, False) == "restart" and restart_due(100, 160, 3599, False) == "skip"
+    assert restart_due(100, 160, 9e9, True) is None  # dark: later, once the signal is back
+    for day, month in ((5, 4), (4, 10)):
+        runs, now = [], at(2026, month, day - 1, 12)
+        while now < at(2026, month, day + 1, 12):  # minute by minute, as the agent's loop sees it
+            due = next_restart("02:30", now)
+            now += 60
+            if now >= due:
+                runs.append(time.strftime("%d %H:%M %Z", time.localtime(now)))
+        assert runs == (["05 02:30 AEDT", "06 02:30 AEST"] if month == 4 else ["04 03:30 AEDT", "05 02:30 AEDT"]), runs
+    up = lambda text: (open(os.path.join(tmp, "up"), "w").write(text), uptime(os.path.join(tmp, "up")))[1]
     with tempfile.TemporaryDirectory() as tmp:
+        assert up("3600.25 100.0\n") == 3600.25 and up("") == 0.0
         route = os.path.join(tmp, "route")
         with open(route, "w") as f:
             f.write("Iface\tDestination\tGateway\nwlan0\t0000A8C0\t00000000\nwlan0\t00000000\t0100A8C0\n")

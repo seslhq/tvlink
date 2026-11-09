@@ -1,0 +1,377 @@
+#!/usr/bin/python3 -s
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+"""Synced content. Usage: tvlink-content | tvlink-content status|manifest DIR|test
+
+No argument: tvlink-content.service, root in a sandbox with no capabilities. While CONTENT_URL is set, at start and
+every CONTENT_SYNC_MIN minutes it fetches that manifest (https only, redirects too) and makes the files it lists the
+live set in /var/lib/tvlink/content/current:
+- each file goes into a new set beside the live one, refused once it passes its listed size, and kept only if its
+  sha256 matches; the total is capped. Files unchanged since the live set are linked from it, not fetched again;
+- then current points at the new set, in one rename. Any failure keeps the live set as it was. The set before stays
+  until the next sync, so the splash never loses a file mid-show.
+With CONTENT_URL blank it removes the synced content and exits. The last result goes to /run/tvlink-content, for
+tvlink content status, tvlink doctor and the console.
+
+Manifest: {"files": [{"name": "01-welcome.png", "url": "01-welcome.png", "sha256": "<64 hex>", "size": 48213}]}.
+url is relative to the manifest, or an absolute https link; left out, it is the name. Names are plain file names of
+the kinds tvlink plays. `manifest DIR` prints one for the files in DIR, to serve beside them.
+"""
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CLI = os.environ.get("TVLINK_CLI", "/usr/local/bin/tvlink")
+SYNC = os.environ.get("TVLINK_SYNC", "/var/lib/tvlink/content")
+STATE = os.environ.get("TVLINK_SYNC_STATE", "/run/tvlink-content/state.json")
+MAX_TOTAL = 1 << 30  # 1 GiB of files in all: the card holds the set before and the one being fetched too
+MAX_FILES = 1000
+MAX_MANIFEST = 1 << 20
+KINDS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".mp4", ".webm")  # as tvlink plays them, and index.html
+MANIFEST = ".manifest.json"  # the live set's names and sha256s; a dotfile, so tvlink never plays it
+
+
+class HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """Follows redirects to https links only: a manifest or file never comes over plain HTTP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise urllib.error.URLError("redirected to a link that is not https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+OPENER = urllib.request.build_opener(HttpsOnly)
+
+
+def fetch(url):
+    """An open response for an https URL. Certificates checked as by Python (the system's CAs)."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("not an https link")
+    return OPENER.open(urllib.request.Request(url, headers={"User-Agent": "tvlink"}), timeout=30)
+
+
+def ok_name(name):
+    """A plain file name of a kind tvlink plays: no folders, no dotfiles, no control characters."""
+    return (isinstance(name, str) and 0 < len(name.encode()) <= 255 and not name.startswith(".")
+            and not re.search(r"[/\\\x00-\x1f\x7f]", name)
+            and (name.lower().endswith(KINDS) or name.lower() == "index.html"))
+
+
+def parse(data, base):
+    """[(name, url, sha256, size)] from a manifest, checked; ValueError says what is wrong."""
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        raise ValueError("the manifest is not JSON") from None
+    files = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(files, list):
+        raise ValueError('the manifest has no "files" list')
+    if len(files) > MAX_FILES:
+        raise ValueError(f"over {MAX_FILES} files")
+    out, seen, total = [], set(), 0
+    for i, f in enumerate(files, 1):
+        if not isinstance(f, dict):
+            raise ValueError(f"file {i} is not an object")
+        name, sha, size = f.get("name"), f.get("sha256"), f.get("size")
+        url = f.get("url", urllib.parse.quote(name) if isinstance(name, str) else None)
+        if not ok_name(name):
+            raise ValueError(f"file {i}: not a plain image, video or index.html name")
+        if name in seen:
+            raise ValueError(f"{name}: listed twice")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError(f"{name}: sha256 is not 64 hex digits")
+        if type(size) is not int or size < 0:
+            raise ValueError(f"{name}: size is not a whole number of bytes")
+        if not isinstance(url, str) or urllib.parse.urlsplit(url := urllib.parse.urljoin(base, url)).scheme != "https":
+            raise ValueError(f"{name}: url is not an https link")
+        total += size
+        if total > MAX_TOTAL:
+            raise ValueError(f"over the {MAX_TOTAL >> 20} MB cap: refused")
+        seen.add(name)
+        out.append((name, url, sha.lower(), size))
+    return out
+
+
+def download(url, path, size, sha256, deadline):
+    """The file at url into path: no more than size bytes, and only with that sha256."""
+    h, n = hashlib.sha256(), 0
+    with fetch(url) as r, open(path, "xb") as f:
+        while chunk := r.read(1 << 16):
+            n += len(chunk)
+            if n > size:
+                raise ValueError("bigger than its listed size")
+            if time.monotonic() > deadline:
+                raise ValueError("too slow: the sync ran past an hour")
+            h.update(chunk)
+            f.write(chunk)
+    if n != size:
+        raise ValueError(f"{n} bytes, not {size}")
+    if h.hexdigest() != sha256:
+        raise ValueError("checksum does not match")
+
+
+def live(root):
+    """(path of the live set, its {name: sha256}), or (None, {})."""
+    path = os.path.join(root, "current")
+    if not os.path.isdir(path):
+        return None, {}
+    try:
+        with open(os.path.join(path, MANIFEST)) as f:
+            return os.path.realpath(path), json.load(f)
+    except (OSError, ValueError):
+        return os.path.realpath(path), {}
+
+
+def prune(root, keep):
+    """Everything in root but current and the set it points at: older sets, and a set a stopped sync left."""
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if name != "current" and os.path.realpath(path) != keep:
+            shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.remove(path)
+
+
+def summary(files):
+    mb = sum(f[3] for f in files) / 2**20
+    return f"{len(files)} file{'' if len(files) == 1 else 's'}, {mb:.0f} MB" if mb >= 1 or not files else \
+        f"{len(files)} file{'' if len(files) == 1 else 's'}, under 1 MB"
+
+
+def sync(url, root=SYNC):
+    """The manifest's files as the live set: a message saying what changed. Raises ValueError or OSError (urllib's
+    errors are OSErrors) with the live set left as it was."""
+    os.makedirs(root, 0o755, exist_ok=True)
+    current, had = live(root)
+    prune(root, current)
+    with fetch(url) as r:
+        data = r.read(MAX_MANIFEST + 1)
+    if len(data) > MAX_MANIFEST:
+        raise ValueError(f"the manifest is over {MAX_MANIFEST >> 20} MB")
+    files = parse(data, url)
+    want = {name: sha for name, _, sha, _ in files}
+    if current and had == want:
+        return f"{summary(files)}, unchanged"
+    new, deadline = tempfile.mkdtemp(prefix="set-", dir=root), time.monotonic() + 3600
+    try:
+        for name, furl, sha, size in files:
+            dst = os.path.join(new, name)
+            if had.get(name) == sha:
+                try:
+                    os.link(os.path.join(current, name), dst)
+                    continue
+                except OSError:
+                    pass  # gone from the live set: fetch it
+            try:
+                download(furl, dst, size, sha, deadline)
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                raise ValueError(f"{name}: {reason(e)}") from None
+            os.chmod(dst, 0o644)
+        with open(os.path.join(new, MANIFEST), "w") as f:
+            json.dump(want, f)
+        os.chmod(new, 0o755)
+        link = os.path.join(root, ".current")
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(os.path.basename(new), link)
+        os.replace(link, os.path.join(root, "current"))
+    except BaseException:
+        shutil.rmtree(new, ignore_errors=True)
+        raise
+    return f"{summary(files)}, new"
+
+
+def clear(root=SYNC):
+    if os.path.isdir(root) and os.listdir(root):
+        prune(root, None)
+        os.remove(os.path.join(root, "current")) if os.path.lexists(os.path.join(root, "current")) else None
+        print("CONTENT_URL blank: synced content removed", flush=True)
+
+
+def reason(e):
+    """Why a fetch failed, without the link (it can carry a key)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code}"
+    if isinstance(e, urllib.error.URLError):
+        return str(e.reason)
+    return str(e) or type(e).__name__
+
+
+def save_state(ok, message, path=STATE):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"time": int(time.time()), "ok": ok, "message": message}, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def status(path=STATE):
+    """The last sync's result, one line."""
+    try:
+        with open(path) as f:
+            s = json.load(f)
+        return f"{'OK' if s['ok'] else 'Failed'} {time.strftime('%H:%M', time.localtime(s['time']))}: {s['message']}"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "not synced yet"
+
+
+def manifest(folder):
+    """A manifest for the files tvlink plays in folder, by name, each url relative (served beside it)."""
+    files = []
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if not ok_name(name) or not os.path.isfile(path):
+            continue
+        h, size = hashlib.sha256(), 0
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+                size += len(chunk)
+        files.append({"name": name, "url": urllib.parse.quote(name), "sha256": h.hexdigest(), "size": size})
+    return json.dumps({"files": files}, indent=1)
+
+
+def settings(cli=CLI):
+    out = subprocess.run([cli, "show"], capture_output=True, text=True, errors="replace", timeout=60).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def main():
+    conf = settings()
+    url = conf.get("CONTENT_URL", "")
+    if not url:
+        clear()
+        return 0
+    every = int(conf.get("CONTENT_SYNC_MIN") or 15) * 60
+    print(f"Syncing from {urllib.parse.urlsplit(url).hostname} every {every // 60} min", flush=True)
+    fails, said = 0, None
+    while True:
+        try:
+            ok, msg, fails = True, sync(url), 0
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            ok, msg, fails = False, f"{reason(e)}; kept the set before", fails + 1
+        if msg != said:  # log changes, not every unchanged sync
+            print(("Synced: " if ok else "Sync failed: ") + msg, flush=True)
+            said = msg
+        save_state(ok, msg)
+        time.sleep(every if ok else min(every, 60 * 2 ** min(fails, 4)))  # after a failure: 2, 4, 8, 16 min
+
+
+def test():
+    import io
+    global fetch
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+    base = "https://cdn.example.com/tv/manifest.json"
+    entry = lambda name, body, **kw: {"name": name, "sha256": sha(body), "size": len(body), **kw}
+    doc = lambda *files: json.dumps({"files": list(files)}).encode()
+    # Manifest checks
+    a, b = b"image a", b"image b"
+    got = parse(doc(entry("01 a.png", a), entry("b.jpg", b, url="https://other.example.com/b.jpg")), base)
+    assert got == [("01 a.png", "https://cdn.example.com/tv/01%20a.png", sha(a), len(a)),
+                   ("b.jpg", "https://other.example.com/b.jpg", sha(b), len(b))], got
+    for bad, why in ((b"{", "not JSON"), (b"[]", "no \"files\""), (doc(entry("../x.png", a)), "plain"),
+                     (doc(entry(".x.png", a)), "plain"), (doc(entry("x.exe", a)), "plain"),
+                     (doc(entry("a/b.png", a)), "plain"), (doc(entry("x.png", a), entry("x.png", a)), "twice"),
+                     (doc({**entry("x.png", a), "sha256": "abc"}), "64 hex"),
+                     (doc({**entry("x.png", a), "size": "7"}), "whole number"),
+                     (doc({**entry("x.png", a), "size": True}), "whole number"),
+                     (doc(entry("x.png", a, url="http://cdn.example.com/x.png")), "https"),
+                     (doc({**entry("x.png", a), "size": MAX_TOTAL + 1}), "cap")):
+        try:
+            parse(bad, base)
+            raise AssertionError(f"accepted: {bad!r}")
+        except ValueError as e:
+            assert why in str(e), (why, str(e))
+    assert parse(doc(entry("index.html", a)), base)[0][0] == "index.html"
+    assert not ok_name("x" * 252 + ".png") and ok_name("x" * 251 + ".png")
+    # A redirect to plain HTTP is refused
+    try:
+        HttpsOnly().redirect_request(urllib.request.Request(base), None, 302, "", {}, "http://cdn.example.com/x")
+        raise AssertionError("followed a redirect to http")
+    except urllib.error.URLError:
+        pass
+    assert reason(urllib.error.HTTPError(base + "?key=secret", 404, "Not Found", {}, None)) == "HTTP 404"
+    # Syncs against a stand-in server: {url: body}, counting fetches
+    served, fetched = {}, []
+
+    def stand_in(url):
+        fetched.append(url)
+        if url not in served:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return io.BytesIO(served[url])
+
+    fetch = stand_in
+    url = lambda name: f"https://cdn.example.com/tv/{name}"
+    with tempfile.TemporaryDirectory() as root:
+        served.update({url("a.png"): a, url("b.png"): b, base: doc(entry("a.png", a), entry("b.png", b))})
+        assert sync(base, root) == "2 files, under 1 MB, new"
+        cur = os.path.join(root, "current")
+        assert sorted(os.listdir(cur)) == [MANIFEST, "a.png", "b.png"] and open(f"{cur}/a.png", "rb").read() == a
+        assert oct(os.stat(cur).st_mode & 0o777) == "0o755" and oct(os.stat(f"{cur}/a.png").st_mode & 0o777) == "0o644"
+        first, fetched[:] = os.path.realpath(cur), []
+        assert sync(base, root) == "2 files, under 1 MB, unchanged" and fetched == [base]  # nothing fetched again
+        assert os.path.realpath(cur) == first
+        # b changes: only b is fetched, a is linked from the live set; the set before stays until the next sync
+        b2 = b"image b, new"
+        served.update({url("b.png"): b2, base: doc(entry("a.png", a), entry("b.png", b2))})
+        fetched[:] = []
+        assert sync(base, root).endswith(", new") and fetched == [base, url("b.png")]
+        second = os.path.realpath(cur)
+        assert second != first and os.path.isdir(first)
+        assert os.stat(f"{first}/a.png").st_ino == os.stat(f"{cur}/a.png").st_ino
+        # A bad checksum, a file over its size, or a missing one: refused, the live set kept, nothing left behind
+        for bad, why in ((doc(entry("a.png", a), {**entry("c.png", a), "sha256": sha(b)}), "c.png: checksum"),
+                         (doc(entry("a.png", a), {**entry("c.png", a), "size": 3}), "c.png: bigger"),
+                         (doc(entry("a.png", a), entry("d.png", a)), "d.png: HTTP 404")):
+            served.update({url("c.png"): a, base: bad})
+            try:
+                sync(base, root)
+                raise AssertionError(f"accepted: {why}")
+            except ValueError as e:
+                assert str(e).startswith(why), (why, str(e))
+            assert os.path.realpath(cur) == second and open(f"{cur}/b.png", "rb").read() == b2
+            assert sorted(os.listdir(root)) == ["current", os.path.basename(second)]  # the older set pruned
+        served[base] = b"{"
+        try:
+            sync(base, root)
+            raise AssertionError("accepted a broken manifest")
+        except ValueError:
+            assert os.path.realpath(cur) == second
+        clear(root)
+        assert os.listdir(root) == []
+        # State and status
+        state = os.path.join(root, "state.json")
+        assert status(state) == "not synced yet"
+        save_state(False, "c.png: checksum does not match; kept the set before", state)
+        assert re.fullmatch(r"Failed \d\d:\d\d: c\.png: checksum does not match; kept the set before", status(state))
+        # A manifest of a folder, read back
+        src = os.path.join(root, "src")
+        os.mkdir(src)
+        for name, body in (("01 a.png", a), ("b.mp4", b), (".hidden.png", a), ("notes.txt", b)):
+            with open(os.path.join(src, name), "wb") as f:
+                f.write(body)
+        made = parse(manifest(src), base)
+        assert [(n, u.rsplit("/", 1)[1], s) for n, u, s, _ in made] == [("01 a.png", "01%20a.png", sha(a)),
+                                                                      ("b.mp4", "b.mp4", sha(b))], made
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["test"]:
+        test()
+    elif sys.argv[1:] == ["status"]:
+        print(status())
+    elif len(sys.argv) == 3 and sys.argv[1] == "manifest":
+        print(manifest(sys.argv[2]))
+    elif len(sys.argv) == 1:
+        sys.exit(main())
+    else:
+        sys.exit(__doc__)

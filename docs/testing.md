@@ -11,13 +11,17 @@ shellcheck tvlink install.sh tests/*.sh
 python3 tvlink-power test
 python3 tvlink-agent test
 python3 tvlink-console test
+python3 tvlink-content test
 ```
 
 The self-tests cover the settings parser (through `tvlink show`, including `CEC=0` as `POWER_METHOD=none`), the power
 modes, presence and clock logic (including clock changes), every power mode with every power method through a day
 (no re-wake loop with IR), the badge and the dark-screen check, and the console's password hashing, sessions, CSRF
 tokens, login rate limit (and the visitor's address through a tunnel), settings forms, power methods and API tokens;
-and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each
+the daily browser restart's timing (once on the day clocks go back, an hour late when they go forward, never in the
+first hour after boot or while dark); synced content's manifest checks, https-only redirects, and syncs against a
+stand-in server (only changed files fetched, the rest linked; a bad checksum, an oversized or missing file refused
+with the live set kept; older sets pruned) and `manifest`; and the fleet console's unit checks, its calls to stand-in units (the tokens it sends, redirects refused, each
 failure's message), the overview not waiting on a slow or dead unit, and its badges.
 
 ## The VM
@@ -34,7 +38,7 @@ tests/vm.sh
 
 - **First run:** makes the VM and installs, about 10 min. It downloads Debian 13's generic arm64 image (about
   0.5 GB) and the packages, including Chromium. A window shows the VM's screen (tty1, where cage runs).
-- **Later runs:** reinstall from this checkout and run the checks again, in about 4 min.
+- **Later runs:** reinstall from this checkout and run the checks again, in about 9 min.
 - **Exploring:** `limactl shell tvlink` opens a shell in the VM. The repo is mounted read-only at the same path.
 - **Starting over:** `limactl delete -f tvlink`.
 
@@ -53,6 +57,9 @@ tests/vm.sh
 | Board | `python3 -m http.server` on 127.0.0.1:8080 | `systemctl stop tvlink-test-board` |
 | GPU | wlroots software renderer (`WLR_RENDERER=pixman` drop-in) | |
 | Cloudflare Tunnel | The real cloudflared from Cloudflare's repo, with a made-up token that Cloudflare refuses (the VM needs internet) | `tvlink set TUNNEL_TOKEN=...` |
+| USB stick | `dummy_hcd` (a virtual USB controller) and `g_mass_storage` serving a partitioned FAT image with a `tvlink` folder: a real USB mass storage device, through usb-storage, udev and systemd as on a Pi | `modprobe g_mass_storage file=/run/tvlink-test-stick.img removable=1 ro=1` (plug in), `modprobe -r g_mass_storage` (pull out) |
+| Content server | Python's https server on 127.0.0.1:8443 with a certificate from its own CA, which tvlink-content trusts through `SSL_CERT_FILE` (a drop-in) | `systemctl stop tvlink-test-content-server` |
+| Time since boot | `TVLINK_UPTIME` (a drop-in for the kiosk) points at a file saying 99999 s, so the browser restart runs however recently the VM started | |
 | Fleet server | The VM itself: `tvlink-fleet.service` on port 8081 (a drop-in), pointed at the unit's console on `http://127.0.0.1` | `curl http://127.0.0.1:8081/...` |
 
 `tests/vm-test.sh` checks:
@@ -89,6 +96,18 @@ tests/vm.sh
 - the HDMI signal: tvlink-power turns it on at start, `tvlink off` turns cage's output off and `tvlink on` back on,
   status and the console follow, the kiosk keeps running and logs no recovery for a minute in the dark, a kiosk
   restart keeps it off, and the page shows again after;
+- a new `BOARD_URL` swapped in without restarting cage or Chromium and showing on screen, a 404 link refused with the
+  old page kept, and back again;
+- synced content: `tvlink content manifest`, an http link refused, `tvlink content sync` fetching the files (root's,
+  readable by all) that then play and show, a bad checksum refused with the set before kept on screen, and the
+  console's Status saying so;
+- a USB stick: not mounted with `USB_CONTENT=0`, mounted read-only with `nosuid,nodev,noexec` once it is 1, the kiosk
+  unable to write it, played ahead of synced content and on screen; pulled out: unmounted, back to synced content;
+  clearing `CONTENT_URL` removes the synced files;
+- the last good screen: the agent's screenshot without the badge, copied root-owned by `tvlink lastgood`, a link
+  planted in its place not followed; with the board down after a kiosk restart, the splash shows it full screen with
+  the red Offline marker; `LAST_GOOD=0` deletes it;
+- the daily browser restart: a new Chromium at `BROWSER_RESTART` in the same cage, and the page back;
 - HDMI at boot: `HDMI_FORCE_HOTPLUG` adds and removes `vc4.force_hotplug=1` once, leaving the rest of `cmdline.txt`,
   and a second set changes nothing; `tvlink edid capture` refuses the VM's own display (no EDID) and a corrupt EDID,
   saves the stand-in's byte for byte, adds `drm.edid_firmware` once and the file to the initramfs; `clear` removes
@@ -160,4 +179,15 @@ or after a change that touches them, check on the bench with a fresh card and re
   service token show Live; a unit unplugged shows Unreachable at the next look without slowing the page; a wrong
   service token says to check it; Settings and Actions through the fleet reach the unit.
 
+- USB stick on a Pi 5: FAT32 and exFAT sticks with a `tvlink` folder play within seconds of plugging in and stop
+  cleanly when pulled mid-video; a stick without the folder, a second stick, and a Pi booted from a USB drive are left
+  alone; `ls /run/tvlink-usb` empty after.
+- Synced content from a real https host (eg a CDN or object storage): a first sync of a few hundred MB, an unchanged
+  sync writing nothing (`iostat` or the card's write counter), a changed file fetched alone, a server error keeping the
+  set, and a power cut mid-sync leaving the old set playing.
+- Last good screen: unplug the network and reboot: the last page shows with its Offline badge, and the time is right
+  with and without the RTC battery.
+- Link switch: a heavy real dashboard swaps in with no white flash; a link with a login redirect or a 404 keeps the
+  old page.
+- Browser restart: memory after it (`free -m`), and the page back within a minute.
 Reports from your own hardware are welcome as issues: the Pi model, the TV model, and which of these passed.

@@ -1,0 +1,14 @@
+# tvlink USB stick: started by 90-tvlink-usb.rules for a USB drive's FAT or exFAT file system, stopped when it is
+# pulled out. tvlink usb mounts it read-only at /run/tvlink-usb if USB_CONTENT=1 and it has a tvlink folder.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink USB stick %I
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tvlink usb mount %i
+ExecStop=/usr/local/bin/tvlink usb unmount %i

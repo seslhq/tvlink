@@ -1,0 +1,6 @@
+# tvlink: a USB drive's FAT or exFAT file system goes to tvlink-usb@, which decides whether to use it. Not udisks:
+# nothing is mounted for the kiosk user, and nothing but these is mounted at all.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_TYPE}=="vfat|exfat", TAG+="systemd", \
+  ENV{SYSTEMD_WANTS}+="tvlink-usb@%k.service"

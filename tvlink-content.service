@@ -1,0 +1,34 @@
+# tvlink synced content: while CONTENT_URL is set, syncs the files its manifest lists to /var/lib/tvlink/content, at
+# start and every CONTENT_SYNC_MIN minutes; tvlink set and tvlink content sync restart it. Root without capabilities,
+# writing only its own folders: it owns the files the kiosk plays, and the kiosk can't change them.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink synced content from CONTENT_URL
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/tvlink-content
+StateDirectory=tvlink/content
+StateDirectoryMode=0755
+RuntimeDirectory=tvlink-content
+RuntimeDirectoryMode=0755
+UMask=0022
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

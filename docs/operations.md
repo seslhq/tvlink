@@ -26,6 +26,8 @@ Connect for Organisations past a handful of units. Any other remote shell works 
 | `sudo tvlink reboot` | Reboots in 3 s, as a planned reboot (`manual` mode does not wake the TV after it) |
 | `sudo tvlink console claim`, `sudo tvlink console reset` | The console's claim code; back to claim mode after a lost password |
 | `tvlink tunnel` | The tunnel: `off`, `connected` or `not connected` |
+| `sudo tvlink content sync`, `tvlink content status` | Sync `CONTENT_URL` now and print how it went; the last sync's result |
+| `tvlink content manifest DIR` | A manifest for the files in DIR, to serve with them ([synced content](configuration.md#synced-content)) |
 
 - Screenshot off the unit: the console's Status page. Without it: `scp` if SSH is on. In a Connect shell, run
   `base64 /run/tvlink/screen.jpg`, copy all of its output, then on your computer run `base64 -d >screen.jpg`, paste
@@ -80,6 +82,13 @@ halfway: `journalctl -u tvlink-update -f`.
 - Badge changes and page recoveries are in the same log: `journalctl -t tvlink -b | grep 'Badge\|Recover'`.
 - `Tunnel: not connected` in `tvlink doctor`: `journalctl -u tvlink-tunnel -b` ([Cloudflare](cloudflare.md)).
 - `journalctl -u tvlink-power -b`: power mode, clock, wakes and standbys, `TV reports ...`, motion sensor problems.
+- Synced content: `tvlink content status`, then `journalctl -u tvlink-content -b` (it logs changes, not every
+  unchanged sync). `Failed ...: <file>: checksum does not match` means the server's file and manifest differ:
+  regenerate the manifest. The unit keeps playing the set it had.
+- A USB stick that does not play: `USB_CONTENT=1`, a `tvlink` folder at its root, FAT or exFAT;
+  `journalctl -u 'tvlink-usb@*' -b` says why it was not used, and `tvlink doctor` names the stick in use.
+- A new page link that does not show: `journalctl -t tvlink -b | grep 'Page switch'` (the old page stays while the new
+  one fails to load).
 - `tvlink status` says `unknown`: CEC is off in the TV menu, or the TV does not answer power queries. With
   `POWER_METHOD=ir` it always does: IR is one-way.
 - IR does nothing: `sudo tvlink doctor` should name a transmitter on its `TV power` line (else the overlay is not
@@ -106,6 +115,10 @@ halfway: `journalctl -u tvlink-update -f`.
   is plugged in if the site has it, and the TV is on the right input.
 - Wi-Fi password changed: take out the SD card, open `tvlink.conf` on any PC, set `WIFI1_SSID` and `WIFI1_PSK` to the
   new network (in double quotes), put the card back and power on.
+- With `USB_CONTENT=1`, a USB stick with a `tvlink` folder of images or videos plays while it is plugged in (when the
+  page is down, or with `SOURCE=folder`), no PC needed.
+- A full-screen picture with a red `Offline, from ...` badge is the last good screen (`LAST_GOOD=1`): the page has not
+  answered since the Pi started.
 - To report a fault, give the device name and IP shown at the bottom left of the logo screen.
 
 ## Replacing a unit

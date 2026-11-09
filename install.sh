@@ -43,9 +43,15 @@ id tvlink-console >/dev/null 2>&1 || useradd --system -M -d /nonexistent -s /usr
 visudo -cqf tvlink-console.sudoers || { echo "tvlink-console.sudoers does not parse" >&2; exit 1; }
 install -m 440 tvlink-console.sudoers /etc/sudoers.d/tvlink-console
 
-install -m 755 tvlink tvlink-power tvlink-agent tvlink-console /usr/local/bin/
+install -m 755 tvlink tvlink-power tvlink-agent tvlink-console tvlink-content /usr/local/bin/
 install -m 644 tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.service tvlink-reboot.timer \
-  tvlink-console.service tvlink-tunnel.service /etc/systemd/system/
+  tvlink-console.service tvlink-tunnel.service tvlink-content.service tvlink-usb@.service tvlink-lastgood.service \
+  tvlink-lastgood.timer /etc/systemd/system/
+# USB sticks go to tvlink-usb@ (USB_CONTENT); /var/lib/tvlink holds synced content and the last good screen, which
+# the kiosk reads.
+install -m 644 90-tvlink-usb.rules /etc/udev/rules.d/
+udevadm control --reload
+install -d -m 755 /var/lib/tvlink
 install -D -m 644 splash.html /usr/share/tvlink/splash.html
 [ -e "$CONF" ] || install -m 644 tvlink.conf.example "$CONF"
 install -d "$BOOT/tvlink" # local content, see SOURCE
@@ -86,9 +92,11 @@ chmod 755 /etc/initramfs-tools/hooks/tvlink-edid
 [ -z "${SUDO_USER:-}" ] || loginctl enable-linger "$SUDO_USER"
 
 systemctl daemon-reload
-systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer tvlink-console.service
+systemctl enable tvlink.service tvlink-power.service tvlink-net.service tvlink-reboot.timer tvlink-console.service \
+  tvlink-content.service tvlink-lastgood.timer
 # An update takes effect now; a first install starts at the next boot, except the console, so it can be claimed now.
-systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service tvlink-tunnel.service
+systemctl try-restart tvlink.service tvlink-power.service tvlink-net.service tvlink-tunnel.service \
+  tvlink-content.service
 systemctl restart tvlink-console.service
 
 echo "Installed tvlink $(./tvlink show | sed -n 's/^VERSION=//p'). First install: set BOARD_URL if needed, then reboot."

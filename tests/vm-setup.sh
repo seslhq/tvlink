@@ -21,8 +21,9 @@ printf 'Types: deb\nURIs: http://archive.raspberrypi.com/debian/\nSuites: trixie
   "$key" >/etc/apt/sources.list.d/raspi.sources
 apt-mark hold cloud-init # the Pi build would redo its first boot at every Lima start
 apt-get update
-# Pi OS Lite has NetworkManager and zram swap. hostapd and dnsmasq run the test Wi-Fi networks.
-apt-get install -y dosfstools network-manager iw wireless-regdb hostapd dnsmasq-base systemd-zram-generator
+# Pi OS Lite has NetworkManager and zram swap. hostapd and dnsmasq run the test Wi-Fi networks; PIL reads screenshots.
+apt-get install -y dosfstools network-manager iw wireless-regdb hostapd dnsmasq-base systemd-zram-generator \
+  python3-pil
 printf '[zram0]\nzram-size = min(ram, 2048)\n' >/etc/systemd/zram-generator.conf
 
 # The Pi's boot partition is FAT32: a loop image, so tvlink set and install.sh write to FAT as on the Pi.

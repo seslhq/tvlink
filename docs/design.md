@@ -27,6 +27,9 @@ infrared discrete codes nor the HDMI signal.
 | `tvlink-console` | tvlink-console | The console: web pages and JSON API on port 80 ([console](console.md)); root only through sudo for a fixed list of `tvlink` commands |
 | `tvlink-tunnel.service` | a throwaway user | Optional: cloudflared, a Cloudflare Tunnel to the console ([Cloudflare](cloudflare.md)) |
 | `tvlink-console --fleet` | a throwaway user, on a server | Optional: the fleet console, every unit's pages through its API ([fleet](fleet.md)) |
+| `tvlink-content` | root, no capabilities | Optional: syncs the files `CONTENT_URL`'s manifest lists to `/var/lib/tvlink/content` |
+| `tvlink usb` (`tvlink-usb@.service`, from a udev rule) | root | Optional: mounts a USB stick with a `tvlink` folder read-only at `/run/tvlink-usb` |
+| `tvlink lastgood` (`tvlink-lastgood.timer`) | root | Optional: copies the kiosk's last live screenshot to the card, hourly |
 | `tvlink check` | root | Gate for the nightly reboot timer |
 | `tvlink boot` | root | Writes `cmdline.txt` and `config.txt` from the settings; run by install.sh, `tvlink set` and `tvlink edid` |
 | `install.sh` | root | Installs or updates everything; safe to rerun |
@@ -79,6 +82,35 @@ badge state in over the DevTools pipe instead.
   HDMI0, in the Pi kernel's `vc4_hdmi.c`): tvlink sets 1, HDMI0 only, so the free port never shows as a screen.
   Captured EDIDs live in `/lib/firmware/edid/` (where `drm.edid_firmware` looks) and an initramfs-tools hook copies
   them into the initramfs, for a display driver loaded before the root file system.
+- **Local content: one source, never merged.** A USB stick, synced content, then the SD card's folder: the first with
+  files plays, so the screen shows one whole set and a half-copied stick never mixes with the fallback. The stick wins
+  because someone put it there on purpose; synced content beats the card because it is the managed copy. The status
+  loop rescans every 2 s (cheap: one folder listing each), so a stick pulled out stops playing within seconds.
+- **USB sticks through udev and systemd, not udisks.** A rule hands a USB drive's FAT or exFAT file system to
+  `tvlink-usb@.service`, bound to the device, so pulling it out stops the unit, which unmounts. `tvlink usb` mounts
+  only with `USB_CONTENT=1`, only a disk with nothing else mounted (never a Pi booted from USB), one stick at a time,
+  read-only with `nosuid,nodev,noexec`, files readable by all, owned by root; a stick without a `tvlink` folder is let
+  go. Nothing is mounted for the kiosk user or by it.
+- **Synced content: https only, checked, swapped whole.** `tvlink-content` runs as root with no capabilities and
+  writes only its own folders, so the kiosk can read the files and change none. Manifest and files come over https
+  only, redirects included; there is no switch for plain HTTP, not even for tests: the VM test serves https with its
+  own CA, through `SSL_CERT_FILE`, which Python's `ssl` honours. Each file is checked against its listed size while it
+  downloads and its SHA-256 after, into a new set beside the live one; a symlink renamed over `current` swaps the set
+  in one step, and any failure keeps the old one. Unchanged files are hard links to the live set, and an unchanged
+  manifest writes nothing. The set before stays until the next sync, so the splash never loses a file mid-show. A
+  service with its own loop, not a timer: the interval is a setting, and a restart is "sync now".
+- **Last good screen: the kiosk takes it, root keeps it.** The agent saves the live page (badge hidden) to its own
+  `/run/tvlink` every 10 min; an hourly timer has root copy it to `/var/lib/tvlink/last.jpg`, which the kiosk can
+  read but not write. Root reads the kiosk's file as the kiosk (`runuser`, with a timeout), so a link or FIFO planted
+  there gets root nothing, and keeps only a newer JPEG. The card sees one small write an hour at most.
+- **New links without the splash.** The status loop rereads the settings every 2 s, so `tvlink set BOARD_URL` needs no
+  kiosk restart; the agent notes which link the page on screen came from, and when status.js says a different one
+  answers, it opens it in a background tab (with the badge script in first), waits for the load to finish, checks it
+  is no error page or 4xx/5xx, then activates it and closes the old tab. A failure keeps the old page and is retried
+  each minute. `tvlink set` waits up to 45 s for the agent's word in the journal and prints it.
+- **Daily browser restart in the agent.** The agent runs Chromium, so it restarts it alone: cage and the agent stay,
+  the splash shows until the page answers. The time is an instant, as in tvlink-power; never in the first hour after
+  boot, and not while the HDMI signal is off (Chromium makes no page then).
 - **Nightly reboot as the backstop.** At 03:30, never in the first hour after boot, never while an upgrade runs, and
   skipped for up to a week while a configured page is down, so an outage keeps the last good screen.
 - **Staged updates.** unattended-upgrades for Debian and the Raspberry Pi repo at 02:30: canary units nightly, the

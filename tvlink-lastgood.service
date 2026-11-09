@@ -1,0 +1,11 @@
+# tvlink last good screen (LAST_GOOD=1): copies the kiosk's latest live screenshot to /var/lib/tvlink/last.jpg, hourly
+# (tvlink-lastgood.timer), so the card takes one small write an hour at most.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 cpwillis (https://github.com/seslhq/tvlink)
+[Unit]
+Description=tvlink last good screen
+ConditionPathExists=/run/tvlink/last.jpg
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tvlink lastgood

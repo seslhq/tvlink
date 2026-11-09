@@ -27,7 +27,11 @@ through power cuts, network drops and browser crashes without a site visit.
   <img src="docs/images/splash-waiting.png" width="49%" alt="Splash: Can't Reach the Board"></p>
 
 - **Local content.** Images, videos or an `index.html` on the SD card play with no network, as a fallback or on
-  their own.
+  their own. Optionally from a USB stick plugged into the Pi, or synced from an https manifest with every file's
+  checksum checked and the set swapped in whole.
+- **Calm screen changes.** A new page link loads in the background and swaps in once it has loaded, with no splash in
+  between; a link that fails keeps the old page. Optionally, a daily browser restart, and the last good screen shown,
+  marked Offline, when a unit starts with no network.
 - **TV power three ways.** HDMI-CEC; infrared with built-in discrete codes for common brands or codes learned from
   the TV's remote; or the HDMI signal off and on, for TVs that sleep without one. Always on, on-hours, a motion
   sensor, the TV remote, or the remote plus motion wake, with any of them.
@@ -64,6 +68,8 @@ TV  <── HDMI + CEC ──  Raspberry Pi 5, Raspberry Pi OS Lite
                          tvlink-net.service      Wi-Fi networks from the settings file
                          tvlink-console.service  the console on port 80: web pages and JSON API
                          tvlink-tunnel.service   optional: cloudflared, a Cloudflare Tunnel to the console
+                         tvlink-content.service  optional: synced content from an https manifest
+                         tvlink-usb@.service     optional: a USB stick with a tvlink folder, mounted read-only
                          tvlink-reboot.timer     nightly reboot, gated on the page answering
                          /boot/firmware          tvlink.conf and the local content folder (FAT: any PC can edit it)
 ```
@@ -93,15 +99,15 @@ The full guide, including TV settings and the CEC test: [docs/setup.md](docs/set
 
 ## Try it without a Pi
 
-On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi
-and the motion sensor, and runs 161 checks against the real services: [docs/testing.md](docs/testing.md).
+On an Apple silicon Mac, `tests/vm.sh` installs tvlink in a Linux VM with stand-ins for the TV (CEC and IR), Wi-Fi,
+the motion sensor and a USB stick, and runs 205 checks against the real services: [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
 | Guide | Covers |
 | --- | --- |
 | [Setup](docs/setup.md) | Hardware, provisioning a unit, TV settings, the CEC test, EDID, wiring a motion sensor and IR |
-| [Configuration](docs/configuration.md) | Every setting, power modes and methods, local content |
+| [Configuration](docs/configuration.md) | Every setting, power modes and methods, local, USB and synced content, the screen |
 | [Console](docs/console.md) | The unit's web pages and JSON API, claiming, security |
 | [Cloudflare](docs/cloudflare.md) | A tunnel per unit, Access in front, a service token for the fleet console |
 | [Fleet](docs/fleet.md) | The fleet console: installing it on a server, adding units, security |

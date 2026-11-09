@@ -51,6 +51,19 @@ HDMI_FORCE_HOTPLUG=0
 # Corner of the status badge: bottom-right, bottom-left, top-right, top-left, or off.
 OVERLAY_CORNER=bottom-right
 
+# More local content, played ahead of the tvlink folder above, first one with files wins:
+#   USB_CONTENT=1  a USB stick (FAT or exFAT) with a tvlink folder at its root, read-only, while it is plugged in
+#   CONTENT_URL    https link to a manifest of files (docs/configuration.md), synced every CONTENT_SYNC_MIN minutes
+USB_CONTENT=0
+CONTENT_URL=
+CONTENT_SYNC_MIN=15
+
+# 1 = keep an hourly screenshot of the live page; a start with no network and no local content shows it, marked
+# "Offline, from" when it was taken.
+LAST_GOOD=0
+# Restart the browser daily at HH:MM, eg 04:00 (not in the first hour after boot). Blank: never.
+BROWSER_RESTART=
+
 # Wi-Fi, added at each boot (Ethernet needs nothing). Quote names and passwords with spaces or #; a blank password
 # means an open network. WIFI2 is a second network, eg the next one when the site changes its Wi-Fi.
 WIFI_COUNTRY=

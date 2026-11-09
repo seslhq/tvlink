@@ -24,12 +24,16 @@ on_wifi() { nmcli -t -f DEVICE,STATE,CONNECTION device | grep -qx "wlan0:connect
 logged() { journalctl -q -t tvlink --since "$since" | grep "$1" >/dev/null; } # kiosk lines come from its login session
 
 echo "== Install and self-tests"
+command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf # left by an earlier run
 ./install.sh >/var/log/tvlink-test-install.log 2>&1 || { tail -20 /var/log/tvlink-test-install.log; exit 1; }
 check "tvlink-power test" quiet python3 tvlink-power test
 check "tvlink-agent test" quiet python3 tvlink-agent test
 check "tvlink-console test" quiet python3 tvlink-console test
+check "tvlink-content test" quiet python3 tvlink-content test
 # Settings the checks change, as an earlier run that stopped midway may have left them
-tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned HDMI_FORCE_HOTPLUG=0 >/dev/null
+modprobe -r g_mass_storage 2>/dev/null
+tvlink set POWER_METHOD=cec POWER_MODE=schedule IR_CODES=learned HDMI_FORCE_HOTPLUG=0 SOURCE=auto USB_CONTENT=0 \
+  CONTENT_URL= LAST_GOOD=0 BROWSER_RESTART= BOARD_URL= >/dev/null
 for u in tvlink tvlink-power tvlink-net tvlink-console; do
   check "$u running" within 10 systemctl -q is-active "$u"
 done
@@ -409,6 +413,161 @@ out=$(tvlink edid clear); check "EDID clear" says 'EDID cleared'
 check "... file gone" test ! -e /lib/firmware/edid/tvlink-HDMI-A-1.bin
 check "... cmdline.txt without it" quiet test "$(grep -c edid_firmware /boot/firmware/cmdline.txt)" = 0
 check "... initramfs without it" quiet test "$(initrd | grep -c tvlink-HDMI)" = 0
+
+echo "== Content and screen"
+python3 -c 'import PIL' 2>/dev/null || # reads the screenshots
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pil >/dev/null 2>&1
+png() { # RRGGBB: a small PNG of that colour, on stdout
+  python3 -c 'import struct, sys, zlib
+w, h, rgb = 64, 36, bytes.fromhex(sys.argv[1])
+chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+raw = b"".join(b"\0" + rgb * w for _ in range(h))
+sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                       + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))' "$1"
+}
+# A JPEG's colour at x y (negative: from the right or bottom), as RRGGBB; with a colour, whether the box from there to
+# the corner is all near it. near: two colours within JPEG's error. shows: a new screenshot has the colour mid-screen.
+img() {
+  python3 -c 'import sys
+from PIL import Image
+im, x, y = Image.open(sys.argv[1]).convert("RGB"), int(sys.argv[2]), int(sys.argv[3])
+box = im.crop((x % im.width, y % im.height, im.width, im.height)).getdata()
+if len(sys.argv) == 4:
+    print("%02x%02x%02x" % box[0])
+else:
+    sys.exit(max(abs(a - b) for p in box for a, b in zip(p, bytes.fromhex(sys.argv[4]))) > 24)' "$@"
+}
+near() { python3 -c 'import sys; a, b = (bytes.fromhex(x) for x in sys.argv[1:]); sys.exit(max(abs(i - j) for i, j in
+  zip(a, b)) > 24)' "$1" "$2"; }
+shows() { tvlink screenshot >/dev/null 2>&1 && near "$(img /run/tvlink/screen.jpg 960 540)" "$1"; }
+from() { grep -q "\"source\":\"$1\"" /run/tvlink/status.js; }
+pids() { echo "$(pgrep -u kiosk -o -x cage) $(pgrep -u kiosk -o -x chromium)"; }
+board=112233 # the test board's background
+
+echo "-- Link switch without a restart"
+echo '<!doctype html><title>B</title><body style="background:#a13;color:#fff;font:80px sans-serif">B' \
+  >/run/board/b.html
+check "the board is up" within 60 shows "$board"
+was=$(pids)
+out=$(tvlink set BOARD_URL=http://127.0.0.1:8080/b.html); check "a new BOARD_URL loads in the background" \
+  says 'Page switch: the new page is showing'
+check "... the kiosk and Chromium kept running" test "$(pids)" = "$was"
+check "... the new page on screen" within 10 shows aa1133
+out=$(tvlink set BOARD_URL=http://127.0.0.1:8080/missing.html)
+check "a page that fails to load (404) is refused" says 'Page switch failed (HTTP 404): keeping the old page'
+check "... the old page stays" shows aa1133
+out=$(tvlink set BOARD_URL=http://127.0.0.1:8080/); check "back to the first" says 'Page switch: the new page'
+check "... without a restart" test "$(pids)" = "$was"
+check "... on screen" within 10 shows "$board"
+
+echo "-- Synced content (an https server with its own CA)"
+d=/run/tvlink-test-content
+mkdir -p "$d/src" && command rm -f "$d"/src/*
+[ -e "$d/ca.pem" ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 -keyout "$d/key.pem" -out "$d/ca.pem" 2>/dev/null
+systemctl -q is-active tvlink-test-content-server || systemd-run -q --unit tvlink-test-content-server python3 -c '
+import http.server, ssl, sys
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 8443),
+    lambda *a: http.server.SimpleHTTPRequestHandler(*a, directory=sys.argv[1] + "/src"))
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+c.load_cert_chain(sys.argv[1] + "/ca.pem", sys.argv[1] + "/key.pem")
+s.socket = c.wrap_socket(s.socket, server_side=True)
+s.serve_forever()' "$d"
+# Python checks certificates against SSL_CERT_FILE when it is set: the test's CA, for this service only
+mkdir -p /etc/systemd/system/tvlink-content.service.d
+printf '[Service]\nEnvironment=SSL_CERT_FILE=%s/ca.pem\n' "$d" >/etc/systemd/system/tvlink-content.service.d/vm.conf
+systemctl daemon-reload
+png 3311aa >"$d/src/01-synced.png"
+tvlink content manifest "$d/src" >"$d/manifest.json" && mv "$d/manifest.json" "$d/src/"
+check "tvlink content manifest lists the folder" grep -q '"name": "01-synced.png"' "$d/src/manifest.json"
+out=$(tvlink set CONTENT_URL=http://127.0.0.1:8443/manifest.json 2>&1); check "CONTENT_URL: http refused" says https
+tvlink set CONTENT_URL=https://127.0.0.1:8443/manifest.json SOURCE=folder >/dev/null
+out=$(tvlink content sync); check "content sync" says '^OK .*: 1 file, under 1 MB'
+check "... root's files, readable by all" test "$(stat -c '%U %a' /var/lib/tvlink/content/current/01-synced.png)" = \
+  "root 644"
+check "... played as local content" within 10 from synced
+check "... on screen" within 30 shows 3311aa
+set=$(readlink /var/lib/tvlink/content/current)
+png 3311aa >"$d/src/02-bad.png"
+tvlink content manifest "$d/src" >"$d/manifest.json" && mv "$d/manifest.json" "$d/src/"
+printf x | dd of="$d/src/02-bad.png" bs=1 seek=60 conv=notrunc 2>/dev/null # changed, same size: checksum wrong
+out=$(tvlink content sync); check "a bad checksum is refused" says '^Failed .*02-bad.png: checksum does not match'
+check "... the set before kept" test "$(readlink /var/lib/tvlink/content/current)" = "$set"
+check "... and still on screen" shows 3311aa
+web /api/status >/dev/null
+check "console Status: content and sync" test "$(field content)/$(field sync)" = "Synced, 1 file/$out"
+
+echo "-- USB stick (dummy_hcd and g_mass_storage: a real USB mass storage device)"
+stick=/run/tvlink-test-stick.img
+if [ ! -e "$stick" ]; then
+  truncate -s 64M "$stick"
+  echo 'start=2048, type=c' | sfdisk -q "$stick"
+  loop=$(losetup -fP --show "$stick")
+  mkfs.vfat -n STICK "${loop}p1" >/dev/null
+  mkdir -p /run/tvlink-test-mnt && mount "${loop}p1" /run/tvlink-test-mnt
+  mkdir /run/tvlink-test-mnt/tvlink && png 33aa11 >/run/tvlink-test-mnt/tvlink/stick.png
+  umount /run/tvlink-test-mnt && losetup -d "$loop"
+fi
+usb_part() { lsblk -nro NAME,TRAN | awk '$2 == "usb" {print $1 "1"}' | grep -q .; }
+tvlink set USB_CONTENT=0 >/dev/null
+modprobe dummy_hcd && modprobe g_mass_storage file="$stick" removable=1 ro=1
+check "a stick plugged in" within 15 usb_part
+sleep 2
+check "USB_CONTENT=0: not mounted" no mountpoint -q /run/tvlink-usb
+tvlink set USB_CONTENT=1 >/dev/null
+check "USB_CONTENT=1: mounted" within 10 mountpoint -q /run/tvlink-usb
+check "... read-only, no devices, setuid or programs" grep -q '^ro,nosuid,nodev,noexec' <(findmnt -no OPTIONS \
+  /run/tvlink-usb)
+check "... the kiosk can't write to it" quiet test "$(runuser -u kiosk -- touch /run/tvlink-usb/tvlink/x \
+  >/dev/null 2>&1; echo $?)" != 0
+check "... played ahead of synced content" within 10 from usb
+check "... on screen" within 30 shows 33aa11
+modprobe -r g_mass_storage
+check "pulled out: unmounted" within 10 no mountpoint -q /run/tvlink-usb
+check "... back to synced content" within 10 from synced
+check "... on screen" within 30 shows 3311aa
+tvlink set CONTENT_URL= USB_CONTENT=0 SOURCE=auto >/dev/null
+empty() { [ -z "$(ls -A "$1")" ]; }
+check "CONTENT_URL cleared: synced content removed" within 10 empty /var/lib/tvlink/content
+
+echo "-- Last good screen"
+tvlink set LAST_GOOD=1 >/dev/null
+check "the agent keeps the live page" within 120 test -s /run/tvlink/last.jpg
+systemctl start tvlink-lastgood
+check "... root copies it to the card" test "$(stat -c '%U %a' /var/lib/tvlink/last.jpg)" = "root 644"
+check "... the page, without the badge" img /var/lib/tvlink/last.jpg -400 -100 "$board"
+sum=$(md5sum </var/lib/tvlink/last.jpg)
+runuser -u kiosk -- ln -sf /etc/shadow /run/tvlink/last.jpg
+systemctl start tvlink-lastgood
+check "... a link planted there is not followed" test "$(md5sum </var/lib/tvlink/last.jpg)" = "$sum"
+runuser -u kiosk -- rm -f /run/tvlink/last.jpg
+systemctl stop tvlink-test-board
+systemctl restart tvlink
+check "board down, kiosk restarted: the splash has it" within 60 grep -qs '"state":"waiting".*"last":[1-9]' \
+  /run/tvlink/status.js
+check "... full screen" within 30 shows "$board"
+check "... marked Offline" near "$(img /run/tvlink/screen.jpg -30 -40)" f04438
+systemd-run -q --unit tvlink-test-board python3 -m http.server 8080 --bind 127.0.0.1 --directory /run/board
+tvlink set LAST_GOOD=0 >/dev/null
+check "LAST_GOOD=0 removes it" test ! -e /var/lib/tvlink/last.jpg
+
+echo "-- Daily browser restart"
+echo '99999 0' >/run/tvlink-test-uptime # past the first hour after boot, whenever the VM started
+printf '[Service]\nEnvironment=TVLINK_UPTIME=/run/tvlink-test-uptime\n' \
+  >/etc/systemd/system/tvlink.service.d/test-uptime.conf
+systemctl daemon-reload
+since=$(date '+%F %T')
+tvlink set BROWSER_RESTART="$(date -d '+2 min' +%H:%M)" >/dev/null
+check "the page is up" within 60 logged 'Badge: live'
+was=$(pids)
+check "Chromium restarts at BROWSER_RESTART" within 150 logged 'Daily browser restart'
+new_chromium() { [ -n "$(pgrep -u kiosk -o -x chromium)" ] && [ "$(pids)" != "$was" ]; }
+check "... a new Chromium" within 30 new_chromium
+check "... the same cage" test "$(pids | cut -d' ' -f1)" = "${was%% *}"
+check "... the page comes back" within 60 shows "$board"
+command rm -f /etc/systemd/system/tvlink.service.d/test-uptime.conf
+systemctl daemon-reload
+tvlink set BROWSER_RESTART= >/dev/null
 
 echo "== $fails failed"
 [ "$fails" = 0 ]

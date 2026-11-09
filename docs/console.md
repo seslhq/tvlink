@@ -25,7 +25,7 @@ and prints a new code. API tokens keep working.
 
 | Page | Shows or does |
 | --- | --- |
-| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power and the power method, the tunnel (off, connected or not connected), name, IP, version, uptime, and `tvlink doctor`'s health lines |
+| Status | The last screenshot (Take Screenshot for a new one), the screen state as the badge sees it, the TV's power and the power method, the tunnel (off, connected or not connected), where local content plays from (USB stick, synced or SD card) and the last content sync, name, IP, version, uptime, and `tvlink doctor`'s health lines |
 | Settings | Every setting `tvlink set` takes, as a form built from `tvlink keys --json`; values are checked by `tvlink set` and errors show beside the field; a change to the boot files says to reboot |
 | Actions | Reload Page, Identify, Take Screenshot, TV On and TV Off (by the power method, which the page names), and Reboot (asks first, on the page) |
 | Logs | The last 200 lines of the kiosk, TV power and Wi-Fi network logs |
@@ -66,7 +66,7 @@ plus the `X-CSRF-Token` header on changes (every page sends the token in that re
 
 | Method and path | Body | Answer |
 | --- | --- | --- |
-| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `tunnel` (`off`, `connected`, `not connected`), `uptime` (s), `health` (lines), `screenshot` (time taken, or null). `?brief=1`: `health` empty, in a fraction of the time |
+| `GET /api/status` | | `name`, `ip`, `version`, `state` and `screen` (badge state), `code`, `host`, `tv`, `tunnel` (`off`, `connected`, `not connected`), `content` (eg `USB stick, 3 files`, or `None`), `sync` (`off`, or the last sync, eg `OK 14:05: 4 files, 12 MB, unchanged`), `uptime` (s), `health` (lines), `screenshot` (time taken, or null). `?brief=1`: `health` empty, in a fraction of the time |
 | `GET /api/settings` | | `version` and `keys`: `key`, `type` (`text`, `url`, `time`, `number`, `choice` with `choices`, `secret` with `set`), `label`, `hint`, `value`, `default` |
 | `POST /api/settings` | `{"KEY": "value", ...}` | `{"ok": true}`, or `400` with `error` and the `key` it is about |
 | `POST /api/action` | `{"action": "reload"}`: `reload`, `identify`, `screenshot`, `on`, `off` or `reboot` | `ok` and the command's `message` |

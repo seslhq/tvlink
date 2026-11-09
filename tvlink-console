@@ -62,6 +62,7 @@ METHODS = {"cec": ("HDMI-CEC", "Wakes the TV over HDMI-CEC and switches it to th
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I, O, 0 or 1
 STATES = {"ready": "Live", "folder": "Local Content", "setup": "Ready to Set Up", "network": "No Network",
           "waiting": "Can't Reach the Board", "empty": "No Files to Show", "starting": "Starting"}
+SOURCES = {"usb": "USB stick", "synced": "Synced", "card": "SD card"}  # local content, in the order tvlink picks
 
 
 # Passwords, tokens and claim codes
@@ -298,6 +299,7 @@ def status(brief=False):
     s, sch = read_status(), schema()
     _, tv, _ = tvlink("status", timeout=30)
     _, tunnel, _ = tvlink("tunnel", root=False, timeout=10)
+    _, sync, _ = tvlink("content", "status", root=False, timeout=10)
     _, doctor, err = (True, "", "") if brief else tvlink("doctor", timeout=60)
     _, shot = screen()
     label = STATES.get(s.get("state", ""), s.get("state", "") or "Unknown")
@@ -306,7 +308,15 @@ def status(brief=False):
     return {"name": s.get("name") or socket.gethostname(), "ip": s.get("ip", ""), "version": sch.get("version"),
             "state": s.get("state", ""), "screen": label, "code": s.get("code", ""), "host": s.get("host", ""),
             "tv": tv or "unknown", "method": power_method(sch), "tunnel": tunnel or "unknown", "uptime": uptime(),
+            "content": content_label(s), "sync": sync or "unknown",
             "health": (doctor or err).splitlines(), "screenshot": int(shot) if shot else None}
+
+
+def content_label(s):
+    """Where local content plays from, and how many files: eg USB stick, 3 files."""
+    n = len(s.get("files") or [])
+    where = SOURCES.get(s.get("source", ""))
+    return f"{where}, {n} file{'' if n == 1 else 's'}" if where and n else "None"
 
 
 def networks():
@@ -470,7 +480,8 @@ class Remote:
             raise UnitError(s.get("error") or f"{self.name} answered HTTP {code}")
         SEEN[self.name] = {"time": time.time(), "status": s}
         return {"name": self.name, "ip": "", "version": "", "state": "", "screen": "Unknown", "host": "",
-                "tv": "unknown", "tunnel": "", "uptime": 0, "health": [], "screenshot": None, **s}
+                "tv": "unknown", "tunnel": "", "content": "", "sync": "", "uptime": 0, "health": [], "screenshot": None,
+                **s}
 
     def schema(self):
         code, s = self.json("GET", "/api/settings")
@@ -986,6 +997,7 @@ class Handler(BaseHTTPRequestHandler):
         tv = f'{s["tv"].capitalize()} ({METHODS.get(s.get("method"), METHODS["cec"])[0]})'  # eg Unknown (Infrared)
         rows = [("Screen", f'<span class="pill {level}">{e(s["screen"])}</span>'), ("Board", e(s["host"] or "None")),
                 ("TV", e(tv)), ("Tunnel", e(s.get("tunnel", "").capitalize())),
+                ("Local Content", e(s.get("content") or "None")), ("Content Sync", e(s.get("sync", "").capitalize())),
                 ("Name", e(s["name"])), ("IP", e(s["ip"] or "None")),
                 ("Version", e(s["version"] or "")), ("Uptime", duration(s["uptime"]))]
         body = (f'<div class="grid"><figure>{shot}<figcaption><span>{taken}</span>'
@@ -1287,6 +1299,10 @@ def test():
     assert ss.get(sid) and sum(not v["auth"] for v in ss.data.values()) <= MAX_ANON
     ss.data[sid]["expires"] = time.time() - 1
     assert ss.get(sid) is None
+    # Local content on Status: where from, and how many files
+    assert content_label({"source": "usb", "files": ["/run/tvlink-usb/tvlink/a.png"]}) == "USB stick, 1 file"
+    assert content_label({"source": "synced", "files": ["a.png", "b.mp4"]}) == "Synced, 2 files"
+    assert content_label({"source": "", "files": []}) == "None" and content_label({}) == "None"
     # Rate limit: per client, then for everyone, and the window slides
     lim = Limiter(3, 60)
     for _ in range(3):
